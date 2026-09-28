@@ -1,0 +1,18 @@
+[package]
+name = "catshell-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+memchr.workspace = true
+bitflags.workspace = true
+parking_lot.workspace = true
+polling.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

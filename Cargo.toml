@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = ["catshell-term", "catshell-net", "catshell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cotterma/catshell"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+russh = "0.63"
+russh-sftp = "2.4"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+async-trait = "0.1"
+# Default features select the platform-native store: Keychain on macOS,
+# Credential Manager on Windows, Secret Service on Linux.
+keyring = "4"
+ssh2-config = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memchr = "2"
+bitflags = "2"
+parking_lot = "0.12"
+polling = "3.8"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "7"
+
+egui = "0.36"
+# Default features are off to keep the `glow` renderer out: the terminal grid is drawn
+# with a wgpu pass, so a second backend would be dead weight. x11 and wayland must then
+# be named explicitly, or winit has no Linux backend at all.
+eframe = { version = "0.36", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+egui-wgpu = "0.36"
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+cosmic-text = "0.19"
+swash = "0.2"
+arboard = "3"
+
+catshell-term = { path = "catshell-term" }
+catshell-net = { path = "catshell-net" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

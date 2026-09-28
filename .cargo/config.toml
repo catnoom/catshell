@@ -1,0 +1,13 @@
+# Windows builds otherwise fail in `aws-lc-sys` (pulled in by russh's default crypto
+# backend) with "NASM command not found! Build cannot continue." — building its x86_64
+# assembly from source needs the NASM assembler, which is not part of a normal Rust or
+# Visual Studio install.
+#
+# The crate ships pre-assembled objects for exactly this case; this opts into them. The
+# build script only consults it on Windows x86_64 and only when NASM is genuinely
+# absent, so installing NASM later takes precedence and other platforms are unaffected.
+#
+# Cargo does not override a value already present in the environment, so setting
+# AWS_LC_SYS_PREBUILT_NASM=0 yourself still wins.
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"

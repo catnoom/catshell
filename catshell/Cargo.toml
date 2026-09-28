@@ -1,0 +1,27 @@
+[package]
+name = "catshell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+catshell-term.workspace = true
+catshell-net.workspace = true
+tokio.workspace = true
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+
+egui.workspace = true
+eframe.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+arboard.workspace = true
