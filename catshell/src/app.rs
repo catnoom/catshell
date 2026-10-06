@@ -39,6 +39,12 @@ struct HostEditor {
     user: String,
     identity_file: String,
     error: Option<String>,
+    /// Where the result of an open file dialog will arrive.
+    ///
+    /// The dialog runs on its own thread: `rfd`'s picker blocks until the user chooses,
+    /// and blocking here would freeze the frame loop — the window would stop repainting
+    /// and the system would mark it unresponsive while the dialog is up.
+    picker: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 impl HostEditor {
@@ -65,6 +71,67 @@ impl HostEditor {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             error: None,
+            picker: None,
+        }
+    }
+
+    /// Whether a file dialog is currently open.
+    fn picking(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// Open a dialog to choose a private key file.
+    fn pick_identity_file(&mut self) {
+        if self.picking() {
+            return;
+        }
+
+        // Start where keys actually live, so the common case needs no navigation.
+        let start = dirs::home_dir().map(|home| home.join(".ssh"));
+        let start = start.filter(|path| path.is_dir());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.picker = Some(receiver);
+
+        std::thread::Builder::new()
+            .name("catshell-file-dialog".into())
+            .spawn(move || {
+                let mut dialog = rfd::FileDialog::new().set_title("Choose a private key");
+                if let Some(start) = start {
+                    dialog = dialog.set_directory(start);
+                }
+                // No extension filter: SSH private keys usually have no extension at all
+                // (`id_ed25519`, `id_rsa`), so filtering would hide exactly the files
+                // being looked for.
+                let _ = sender.send(dialog.pick_file().map(|file| file.to_path_buf()));
+            })
+            .ok();
+    }
+
+    /// Take the chosen file, if the dialog has finished.
+    ///
+    /// Returns whether a dialog is still open, so the caller knows to keep repainting —
+    /// otherwise the UI would go idle and never notice the answer.
+    fn poll_picker(&mut self) -> bool {
+        let Some(receiver) = &self.picker else {
+            return false;
+        };
+        match receiver.try_recv() {
+            Ok(chosen) => {
+                if let Some(path) = chosen {
+                    self.identity_file = path.to_string_lossy().into_owned();
+                    // A previous complaint about this field is no longer current.
+                    self.error = None;
+                }
+                self.picker = None;
+                false
+            }
+            // The dialog thread died without answering; stop waiting on it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.picker = None;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
         }
     }
 
@@ -270,9 +337,14 @@ impl App {
     fn add_pane(&mut self, session: Session, origin: Origin, size: GridSize) -> PaneId {
         // Type the integration snippet only when it could not be installed invisibly.
         // A local bash gets it through its environment at spawn time (see
-        // `local_integration`); anything else has to be typed, which the shell echoes.
+        // `local_integration`); a remote shell has to be told at its prompt, because no
+        // server passes an environment through and an exported hook would be overwritten
+        // by the host's own rc files anyway.
+        //
+        // Sent hidden: the remote echoes a typed line back, and that echo is catshell's
+        // plumbing rather than anything the user asked to see.
         if let Some(shell) = self.typed_integration(&origin) {
-            session.write(catshell_term::integration::install_command(shell).into_bytes());
+            session.write_hidden(catshell_term::integration::install_command(shell).into_bytes());
         }
 
         let id = self.next_pane_id;
@@ -717,6 +789,17 @@ impl App {
 
         let mut save = false;
         let mut cancel = false;
+        let mut browse = false;
+        let mut clear_key = false;
+
+        // A dialog is open on another thread; keep painting so its answer is noticed.
+        let picking = match &mut self.host_editor {
+            Some(editor) => editor.poll_picker(),
+            None => false,
+        };
+        if picking {
+            ctx.request_repaint();
+        }
 
         egui::Modal::new(egui::Id::new("catshell host editor")).show(ctx, |ui| {
             ui.set_width(440.0);
@@ -741,9 +824,7 @@ impl App {
                             .hint_text("how it appears in the sidebar")
                             .desired_width(f32::INFINITY),
                     );
-                    if editor.original_name.is_none() {
-                        name.request_focus();
-                    }
+                    focus_when_opened(ui, &name);
                     ui.end_row();
 
                     ui.label("Address");
@@ -767,11 +848,26 @@ impl App {
                     ui.end_row();
 
                     ui.label("Key file");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut editor.identity_file)
-                            .hint_text("blank tries the ssh-agent")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.horizontal(|ui| {
+                        // The dialog is a convenience, not the only way in: the path
+                        // stays editable so it can be pasted or typed, which is what a
+                        // remote or not-yet-created key needs.
+                        if ui
+                            .add_enabled(!picking, egui::Button::new("Browse…"))
+                            .on_hover_text("Choose a private key file")
+                            .clicked()
+                        {
+                            browse = true;
+                        }
+                        if !editor.identity_file.is_empty() && ui.button("Clear").clicked() {
+                            clear_key = true;
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.identity_file)
+                                .hint_text("blank tries the ssh-agent")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
                     ui.end_row();
                 });
 
@@ -799,11 +895,24 @@ impl App {
             });
         });
 
+        if browse {
+            if let Some(editor) = &mut self.host_editor {
+                editor.pick_identity_file();
+            }
+        }
+        if clear_key {
+            if let Some(editor) = &mut self.host_editor {
+                editor.identity_file.clear();
+            }
+        }
+
         if cancel {
             self.host_editor = None;
             return;
         }
-        if !save {
+        // Enter is bound to Save, and a file dialog closing can deliver one; ignore it
+        // while a dialog is up so choosing a key does not also submit the form.
+        if !save || picking {
             return;
         }
 
@@ -894,7 +1003,7 @@ impl App {
                             .password(true)
                             .desired_width(f32::INFINITY),
                     );
-                    field.request_focus();
+                    focus_when_opened(ui, &field);
                     ui.checkbox(
                         &mut self.remember_password,
                         "Remember in the system keyring",
@@ -1252,7 +1361,7 @@ impl App {
                     ui.heading(heading);
                     let field =
                         ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                    field.request_focus();
+                    focus_when_opened(ui, &field);
                     if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         confirm = true;
                     }
@@ -1404,9 +1513,30 @@ impl App {
         }
     }
 
+    /// Whether a dialog is up and owns the keyboard.
+    ///
+    /// Covers dialogs with no text field of their own — the delete confirmation, for
+    /// instance — where `wants_keyboard_input` is false but typing still must not reach
+    /// the shell.
+    fn modal_open(&self) -> bool {
+        self.prompt.is_some() || self.file_op.is_some() || self.host_editor.is_some()
+    }
+
     /// Route this frame's keyboard input to the focused pane, or to every pane in the
     /// tab when broadcast is on.
     fn handle_input(&mut self, ctx: &egui::Context) {
+        // A text field or a dialog takes the keyboard exclusively. The terminal reads the
+        // *raw* event list, which egui's widgets read too, so without this every
+        // keystroke goes to both — a password typed into the prompt would also be sent
+        // to the shell behind it, and run there as a command.
+        //
+        // Specifically `text_edit_focused`, not `egui_wants_keyboard_input`: the latter
+        // is true for any focused widget, so a sidebar button left focused by a Tab
+        // would silently stop the terminal receiving input at all.
+        if self.modal_open() || ctx.text_edit_focused() {
+            return;
+        }
+
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -1473,6 +1603,18 @@ impl App {
         if shot.take_open_host_editor() {
             self.host_editor = Some(HostEditor::new(HostEditor::blank(), false));
         }
+        let pick = self
+            .screenshotter
+            .as_mut()
+            .is_some_and(|shot| shot.take_open_file_picker());
+        if pick {
+            if let Some(editor) = &mut self.host_editor {
+                editor.pick_identity_file();
+            }
+        }
+        let Some(shot) = &mut self.screenshotter else {
+            return;
+        };
 
         let wanted = shot.take_connect();
         if !wanted.is_empty() {
@@ -1565,6 +1707,11 @@ impl App {
             egui::Id::new(("catshell pane", id)),
             egui::Sense::click_and_drag(),
         );
+
+        // Not while a dialog is up: it owns the keyboard, and its fields need Tab.
+        if focused && !self.modal_open() {
+            claim_keyboard(ui, &response);
+        }
 
         let columns = (rect.width() / cell.x).floor().max(1.0) as usize;
         let lines = (rect.height() / cell.y).floor().max(1.0) as usize;
@@ -1886,6 +2033,50 @@ fn default_shell() -> Option<String> {
     std::env::var("SHELL").ok()
 }
 
+/// Hold egui's keyboard focus for a terminal pane, and claim the keys egui would
+/// otherwise use to move between widgets.
+///
+/// Without this, Tab does two things at once: the shell completes a filename *and* egui
+/// moves focus to the next button — so the Return that follows presses that button
+/// instead of running the command. Arrow keys would walk the interface while scrolling
+/// shell history, and Escape would surrender focus mid-session, which matters to
+/// everything from vim to a pager.
+fn claim_keyboard(ui: &mut egui::Ui, pane: &egui::Response) {
+    // Taken back from anything that is not a text field. In a terminal the keyboard
+    // belongs to the shell by default, so clicking a button in the interface should do
+    // that button's job and hand the keyboard straight back — otherwise the next Tab
+    // walks the interface instead of completing a filename.
+    let elsewhere = ui.ctx().text_edit_focused();
+    if !elsewhere && !pane.has_focus() {
+        pane.request_focus();
+    }
+    if pane.has_focus() {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                pane.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
+    }
+}
+
+/// Give a dialog's first field focus when the dialog opens, and only then.
+///
+/// `Response::request_focus` has to be called every frame to *hold* focus, so calling it
+/// unconditionally pins the cursor to that one field forever — Tab and clicks into the
+/// next field are undone the moment the frame redraws. Claiming focus only when nothing
+/// else has it focuses the field on the first frame and then leaves the user alone.
+fn focus_when_opened(ui: &egui::Ui, field: &egui::Response) {
+    if ui.memory(|memory| memory.focused().is_none()) {
+        field.request_focus();
+    }
+}
+
 /// Quote a path for a POSIX shell.
 ///
 /// The explorer types `cd <path>` into a live shell, and a path is not trustworthy
@@ -1983,6 +2174,375 @@ mod tests {
         // Ctrl+Tab cycles panes without needing shift.
         assert!(is_shortcut(Key::Tab, ctrl));
         assert!(!is_shortcut(Key::Tab, Modifiers::default()));
+    }
+
+    // --- Dialog focus and input routing ---------------------------------------------
+    //
+    // Run against a headless `egui::Context`, which is the only way to exercise focus:
+    // egui resolves Tab and click-to-focus inside its own frame processing, so events
+    // injected from application code arrive too late to move focus.
+
+    /// Draw two text fields, focusing the first through `focus_when_opened`.
+    fn two_fields(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        first: &mut String,
+        second: &mut String,
+    ) -> (egui::Id, egui::Id) {
+        let mut ids = (egui::Id::NULL, egui::Id::NULL);
+        let mut output = ctx.run_ui(input, |ui| {
+            let a = ui.add(egui::TextEdit::singleline(first));
+            focus_when_opened(ui, &a);
+            let b = ui.add(egui::TextEdit::singleline(second));
+            ids = (a.id, b.id);
+        });
+        // A headless run still produces font textures, and epaint refuses to have them
+        // dropped unhandled.
+        output.textures_delta.clear();
+        ids
+    }
+
+    #[test]
+    fn the_first_field_takes_focus_when_a_dialog_opens() {
+        let ctx = egui::Context::default();
+        let (mut first, mut second) = (String::new(), String::new());
+
+        let (a, _) = two_fields(&ctx, Default::default(), &mut first, &mut second);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(a),
+            "the first field was not focused"
+        );
+    }
+
+    #[test]
+    fn focus_moves_to_the_next_field_and_stays_there() {
+        // The reported bug: `request_focus` called every frame pinned the cursor to the
+        // first field, so Tab and clicks into the next one were undone on the redraw.
+        let ctx = egui::Context::default();
+        let (mut first, mut second) = (String::new(), String::new());
+
+        let (_, b) = two_fields(&ctx, Default::default(), &mut first, &mut second);
+        ctx.memory_mut(|m| m.request_focus(b));
+
+        // Several more frames, because the old bug reasserted itself on every one.
+        for frame in 0..5 {
+            two_fields(&ctx, Default::default(), &mut first, &mut second);
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(b),
+                "focus was yanked back to the first field on frame {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn typing_reaches_only_the_field_that_has_focus() {
+        let ctx = egui::Context::default();
+        let (mut first, mut second) = (String::new(), String::new());
+        let (_, b) = two_fields(&ctx, Default::default(), &mut first, &mut second);
+        ctx.memory_mut(|m| m.request_focus(b));
+        two_fields(&ctx, Default::default(), &mut first, &mut second);
+
+        let typed = egui::RawInput {
+            events: vec![egui::Event::Text("abc".into())],
+            ..Default::default()
+        };
+        two_fields(&ctx, typed, &mut first, &mut second);
+
+        assert_eq!(second, "abc", "typing did not reach the focused field");
+        assert!(first.is_empty(), "typing also landed in the first field");
+    }
+
+    #[test]
+    fn a_focused_text_field_claims_the_keyboard() {
+        // This is the signal `handle_input` uses to keep keystrokes out of the shell.
+        let ctx = egui::Context::default();
+        let (mut first, mut second) = (String::new(), String::new());
+        two_fields(&ctx, Default::default(), &mut first, &mut second);
+
+        assert!(
+            ctx.text_edit_focused(),
+            "a focused text field did not claim the keyboard, so typing would also reach \
+             the terminal behind the dialog"
+        );
+    }
+
+    #[test]
+    fn nothing_claims_the_keyboard_when_no_field_is_focused() {
+        // The converse: with no dialog up, the terminal must still receive input.
+        let ctx = egui::Context::default();
+        ctx.run_ui(Default::default(), |ui| {
+            ui.label("no fields here");
+        })
+        .textures_delta
+        .clear();
+        assert!(!ctx.text_edit_focused());
+    }
+
+    #[test]
+    fn a_focused_button_does_not_claim_the_keyboard() {
+        // Why `text_edit_focused` rather than `egui_wants_keyboard_input`: the latter is
+        // true for any focused widget, so a button left focused by a Tab would silently
+        // stop the terminal receiving input at all.
+        let ctx = egui::Context::default();
+        let mut id = egui::Id::NULL;
+        ctx.run_ui(Default::default(), |ui| {
+            id = ui.button("press me").id;
+        })
+        .textures_delta
+        .clear();
+        ctx.memory_mut(|m| m.request_focus(id));
+        ctx.run_ui(Default::default(), |ui| {
+            let _ = ui.button("press me");
+        })
+        .textures_delta
+        .clear();
+
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the button should be focused"
+        );
+        assert!(
+            !ctx.text_edit_focused(),
+            "a focused button must not block the terminal"
+        );
+    }
+
+    /// Draw a terminal-like pane followed by a button, and return their ids.
+    fn pane_and_button(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        claim: bool,
+    ) -> (egui::Id, egui::Id) {
+        let mut ids = (egui::Id::NULL, egui::Id::NULL);
+        ctx.run_ui(input, |ui| {
+            let pane = ui.interact(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0)),
+                egui::Id::new("test pane"),
+                egui::Sense::click_and_drag(),
+            );
+            if claim {
+                claim_keyboard(ui, &pane);
+            }
+            let button = ui.button("somewhere else");
+            ids = (pane.id, button.id);
+        })
+        .textures_delta
+        .clear();
+        ids
+    }
+
+    fn press(key: egui::Key) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_focused_pane_takes_the_keyboard() {
+        let ctx = egui::Context::default();
+        let (pane, _) = pane_and_button(&ctx, Default::default(), true);
+        assert_eq!(ctx.memory(|m| m.focused()), Some(pane));
+    }
+
+    #[test]
+    fn tab_stays_in_the_terminal_instead_of_moving_the_interface() {
+        // The reported bug: Tab completed a filename in the shell *and* moved egui's
+        // focus to the next widget, so the following Return pressed that widget.
+        let ctx = egui::Context::default();
+        let (pane, button) = pane_and_button(&ctx, Default::default(), true);
+        // A second frame, because the lock only applies once the pane has held focus
+        // across a frame boundary.
+        pane_and_button(&ctx, Default::default(), true);
+
+        pane_and_button(&ctx, press(egui::Key::Tab), true);
+        let focused = ctx.memory(|m| m.focused());
+        assert_ne!(
+            focused,
+            Some(button),
+            "Tab moved focus onto a button in the interface"
+        );
+        assert_eq!(focused, Some(pane), "the terminal lost focus on Tab");
+    }
+
+    #[test]
+    fn without_the_claim_tab_does_move_focus() {
+        // Confirms the test above is testing the claim, not a quirk of the harness: the
+        // same pane, focused the same way but without claiming Tab, loses focus to the
+        // next widget — which is the bug that was reported.
+        let ctx = egui::Context::default();
+        let (pane, button) = pane_and_button(&ctx, Default::default(), false);
+        ctx.memory_mut(|m| m.request_focus(pane));
+        pane_and_button(&ctx, Default::default(), false);
+
+        pane_and_button(&ctx, press(egui::Key::Tab), false);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(button),
+            "expected egui's default Tab navigation to move focus off the pane"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_stay_in_the_terminal() {
+        // Shell history and vim both live on the arrow keys; they must not walk the
+        // interface.
+        let ctx = egui::Context::default();
+        let (pane, _) = pane_and_button(&ctx, Default::default(), true);
+        pane_and_button(&ctx, Default::default(), true);
+
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+        ] {
+            pane_and_button(&ctx, press(key), true);
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(pane),
+                "{key:?} moved focus away"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_stays_in_the_terminal() {
+        // Escape is how you leave insert mode, not how you leave the terminal.
+        let ctx = egui::Context::default();
+        let (pane, _) = pane_and_button(&ctx, Default::default(), true);
+        pane_and_button(&ctx, Default::default(), true);
+
+        pane_and_button(&ctx, press(egui::Key::Escape), true);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(pane),
+            "Escape surrendered focus"
+        );
+    }
+
+    #[test]
+    fn the_pane_takes_the_keyboard_back_from_a_button() {
+        // Click "Refresh" in the explorer and the next Tab should still complete a
+        // filename in the shell, not move to the next button.
+        let ctx = egui::Context::default();
+        let (pane, button) = pane_and_button(&ctx, Default::default(), true);
+        ctx.memory_mut(|m| m.request_focus(button));
+
+        pane_and_button(&ctx, Default::default(), true);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(pane),
+            "the keyboard stayed on the button instead of returning to the terminal"
+        );
+    }
+
+    #[test]
+    fn a_pane_holding_the_keyboard_does_not_block_terminal_input() {
+        // `handle_input` stops at `text_edit_focused`; a focused pane is not a text
+        // field, so keystrokes must still reach the shell.
+        let ctx = egui::Context::default();
+        pane_and_button(&ctx, Default::default(), true);
+
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the pane should hold focus"
+        );
+        assert!(
+            !ctx.text_edit_focused(),
+            "a focused pane must not look like a text field"
+        );
+    }
+
+    #[test]
+    fn a_chosen_file_lands_in_the_key_field() {
+        // The dialog answers on a channel; this exercises the receiving half without
+        // needing a real dialog, which cannot be opened in a test.
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        editor.picker = Some(receiver);
+        assert!(editor.picking());
+
+        sender
+            .send(Some(std::path::PathBuf::from("/home/me/.ssh/id_ed25519")))
+            .unwrap();
+        assert!(
+            !editor.poll_picker(),
+            "still waiting after an answer arrived"
+        );
+        assert_eq!(editor.identity_file, "/home/me/.ssh/id_ed25519");
+        assert!(!editor.picking());
+    }
+
+    #[test]
+    fn cancelling_the_dialog_leaves_the_key_field_alone() {
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        editor.identity_file = "/existing/key".into();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        editor.picker = Some(receiver);
+        sender.send(None).unwrap();
+
+        assert!(!editor.poll_picker());
+        assert_eq!(
+            editor.identity_file, "/existing/key",
+            "cancelling cleared the field"
+        );
+    }
+
+    #[test]
+    fn a_dialog_thread_that_dies_does_not_hang_the_form() {
+        // Dropping the sender without answering must not leave the form permanently
+        // believing a dialog is open, which would disable the button forever.
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        let (sender, receiver) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+        editor.picker = Some(receiver);
+        drop(sender);
+
+        assert!(!editor.poll_picker());
+        assert!(!editor.picking());
+    }
+
+    #[test]
+    fn waiting_on_the_dialog_keeps_the_ui_repainting() {
+        // If this returned false while waiting, the frame loop would go idle and never
+        // notice the answer.
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        let (_sender, receiver) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+        editor.picker = Some(receiver);
+        assert!(editor.poll_picker());
+    }
+
+    #[test]
+    fn a_chosen_file_clears_a_stale_complaint() {
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        editor.error = Some("something about the key".into());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        editor.picker = Some(receiver);
+        sender.send(Some(std::path::PathBuf::from("/k"))).unwrap();
+        editor.poll_picker();
+
+        assert!(editor.error.is_none(), "a stale error outlived the fix");
+    }
+
+    #[test]
+    fn opening_a_second_dialog_is_refused_while_one_is_up() {
+        let mut editor = HostEditor::new(HostEditor::blank(), false);
+        let (_sender, receiver) = std::sync::mpsc::channel::<Option<std::path::PathBuf>>();
+        editor.picker = Some(receiver);
+
+        // Must not replace the pending receiver, or the first answer is lost.
+        editor.pick_identity_file();
+        assert!(editor.picking());
     }
 
     #[test]

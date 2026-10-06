@@ -31,6 +31,8 @@ pub struct ScreenshotRequest {
     pub trust_host: bool,
     /// Open the host editor before capturing.
     pub open_host_editor: bool,
+    /// Also open the key-file dialog, to check it does not block the frame loop.
+    pub open_file_picker: bool,
 }
 
 /// Which way to split, kept separate from the app's own `Direction` so this debug-only
@@ -64,6 +66,7 @@ impl ScreenshotRequest {
             password: std::env::var("CATSHELL_PASSWORD").ok(),
             trust_host: std::env::var("CATSHELL_TRUST").is_ok_and(|value| value != "0"),
             open_host_editor: std::env::var("CATSHELL_HOST_EDITOR").is_ok(),
+            open_file_picker: std::env::var("CATSHELL_PICK_KEY").is_ok(),
         })
     }
 }
@@ -124,6 +127,13 @@ impl Screenshotter {
     pub fn take_open_host_editor(&mut self) -> bool {
         let wanted = self.request.open_host_editor;
         self.request.open_host_editor = false;
+        wanted
+    }
+
+    /// Whether the key-file dialog should be opened, the first time this is asked.
+    pub fn take_open_file_picker(&mut self) -> bool {
+        let wanted = self.request.open_file_picker;
+        self.request.open_file_picker = false;
         wanted
     }
 

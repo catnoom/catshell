@@ -232,6 +232,11 @@ impl Pump {
         loop {
             match self.msgs.try_recv() {
                 Ok(Msg::Input(bytes)) => self.enqueue(bytes),
+                Ok(Msg::InputHidden(bytes)) => {
+                    // Armed before the bytes are queued, so the echo cannot beat it back.
+                    self.feed.suppress_echo(&bytes);
+                    self.enqueue(bytes);
+                }
                 Ok(Msg::Resize { size, window_size }) => {
                     self.feed.resize(size, window_size);
                     self.pty.on_resize(window_size);

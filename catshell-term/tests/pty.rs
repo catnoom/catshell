@@ -450,3 +450,95 @@ fn bash_reports_its_directory_from_the_environment_with_nothing_typed() {
         screen(&session)
     );
 }
+
+#[test]
+fn the_typed_snippet_is_installed_without_being_shown() {
+    // The whole point of hiding the echo: a real bash on a real pseudoterminal echoes
+    // the line exactly as a remote shell does, so this reproduces what a user sees on
+    // connecting — and asserts they see none of it.
+    let session = interactive_bash(GridSize::new(100, 24));
+    session.write_hidden(install_command(Shell::Bash).into_bytes());
+    session.write(b"cd /tmp\n".to_vec());
+
+    // The hook still works: this is what the file explorer follows.
+    let events = wait_for_shell_events(&session, "a cwd report from /tmp", |seen| {
+        latest_cwd(seen) == Some("/tmp")
+    });
+    assert_eq!(latest_cwd(&events), Some("/tmp"));
+
+    let screen = screen(&session);
+    assert!(
+        !screen.contains("__catshell_report"),
+        "the snippet was shown to the user:\n{screen}"
+    );
+    assert!(
+        !screen.contains("PROMPT_COMMAND"),
+        "part of the snippet was shown to the user:\n{screen}"
+    );
+    // And what the user did type is still there.
+    assert!(
+        screen.contains("cd /tmp"),
+        "the user's own command vanished:\n{screen}"
+    );
+}
+
+#[test]
+fn hiding_the_snippet_does_not_swallow_the_login_banner() {
+    // Everything printed before the snippet must survive; on a real host that is the
+    // MOTD and the "Last login" line.
+    let session = interactive_bash(GridSize::new(100, 24));
+    session.write(b"echo BANNER-BEFORE\n".to_vec());
+    session.write_hidden(install_command(Shell::Bash).into_bytes());
+    session.write(b"echo AFTER\n".to_vec());
+
+    wait_for_shell_events(&session, "the hook to report", |seen| {
+        seen.iter()
+            .any(|event| matches!(event, ShellEvent::CwdChanged { .. }))
+    });
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !screen(&session).contains("AFTER") {
+        session.drain_events();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let screen = screen(&session);
+    assert!(
+        screen.contains("BANNER-BEFORE"),
+        "output before the snippet was eaten:\n{screen}"
+    );
+    assert!(
+        screen.contains("AFTER"),
+        "output after the snippet was eaten:\n{screen}"
+    );
+    assert!(
+        !screen.contains("__catshell_report"),
+        "the snippet was shown:\n{screen}"
+    );
+}
+
+#[test]
+fn a_user_typing_the_same_text_later_still_sees_it() {
+    // The filter must stop watching once it has taken its own echoes back, or it would
+    // start eating the user's own words.
+    let session = interactive_bash(GridSize::new(100, 24));
+    session.write_hidden(install_command(Shell::Bash).into_bytes());
+    session.write(b"cd /tmp\n".to_vec());
+    wait_for_shell_events(&session, "the hook to report", |seen| {
+        latest_cwd(seen) == Some("/tmp")
+    });
+
+    // Now the user mentions the same function name themselves.
+    session.write(b"echo __catshell_report is the hook\n".to_vec());
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline && !screen(&session).contains("is the hook") {
+        session.drain_events();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let screen = screen(&session);
+    assert!(
+        screen.contains("__catshell_report is the hook"),
+        "the filter ate the user's own text:\n{screen}"
+    );
+}

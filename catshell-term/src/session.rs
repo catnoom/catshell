@@ -14,6 +14,7 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use parking_lot::Mutex;
 
+use crate::echo::{EchoFilter, DEFAULT_BUDGET, EXPECTED_ECHOES};
 use crate::osc::{OscSniffer, ShellEvent};
 use crate::palette::Palette;
 
@@ -176,6 +177,9 @@ pub struct TermFeed {
     sniffer: OscSniffer,
     proxy: EventProxy,
     palette: Palette,
+    /// Removes catshell's own typed commands from the output, so the plumbing it has to
+    /// install is never shown to the user. See [`crate::echo`].
+    echo: Option<EchoFilter>,
 }
 
 impl TermFeed {
@@ -196,6 +200,7 @@ impl TermFeed {
             sniffer: OscSniffer::new(),
             proxy,
             palette,
+            echo: None,
         }
     }
 
@@ -209,22 +214,52 @@ impl TermFeed {
     /// Returns any bytes the program is owed in response (colour and size queries, and
     /// replies the parser generated), which the caller must write back to the source.
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<u8> {
-        // The sniffer only observes; the parser still sees the slice in full.
+        // The sniffer sees the unfiltered stream: shell-integration reports arrive the
+        // same way whether or not the command that installed them is being hidden.
         let proxy = &self.proxy;
         self.sniffer
             .feed(bytes, |event| proxy.send(SessionEvent::Shell(event)));
 
+        // What reaches the grid may have catshell's own echoed commands taken out.
+        let filtered;
+        let display = match &mut self.echo {
+            Some(filter) => {
+                let mut out = Vec::with_capacity(bytes.len());
+                filter.filter(bytes, &mut out);
+                if filter.finished() {
+                    self.echo = None;
+                }
+                filtered = out;
+                filtered.as_slice()
+            }
+            None => bytes,
+        };
+
         {
             let mut term = self.term.lock();
-            self.parser.advance(&mut *term, bytes);
+            self.parser.advance(&mut *term, display);
         }
 
         // Only worth a repaint if the bytes were not swallowed by a synchronized update.
-        if self.parser.sync_bytes_count() < bytes.len() {
+        if self.parser.sync_bytes_count() < display.len() {
             self.proxy.send(SessionEvent::Redraw);
         }
 
         self.take_replies()
+    }
+
+    /// Hide the echo of a command catshell is about to type.
+    ///
+    /// The remote echoes a typed line back — twice, between the pseudoterminal and
+    /// readline — and that is catshell's plumbing, not the user's session.
+    pub fn suppress_echo(&mut self, command: &[u8]) {
+        // Without its newline: the line ending is matched separately, because the
+        // terminal echoes it as `\r\n` rather than the `\n` that was sent.
+        let pattern = command.strip_suffix(b"\n").unwrap_or(command);
+        if pattern.is_empty() {
+            return;
+        }
+        self.echo = Some(EchoFilter::new(pattern, EXPECTED_ECHOES, DEFAULT_BUDGET));
     }
 
     /// Deadline for an in-progress synchronized update (DEC 2026), if any.
@@ -249,6 +284,16 @@ impl TermFeed {
 
     /// Mark the terminal as finished, so the UI stops treating it as live.
     pub fn shutdown(&mut self, reason: ExitReason) {
+        // Anything the echo filter was still holding belongs on screen now, or the tail
+        // of the session's output would simply vanish.
+        if let Some(mut filter) = self.echo.take() {
+            let mut pending = Vec::new();
+            filter.flush(&mut pending);
+            if !pending.is_empty() {
+                self.parser.advance(&mut *self.term.lock(), &pending);
+            }
+        }
+
         self.term.lock().exit();
         self.proxy.send(SessionEvent::Exited(reason));
     }
@@ -294,6 +339,11 @@ pub enum Msg {
     },
     /// Shut the session down.
     Shutdown,
+    /// Type `command` and keep its echo off the screen.
+    ///
+    /// Separate from [`Msg::Input`] because only the driver can arm the filter before
+    /// the bytes go out; doing it from the UI would race the reply coming back.
+    InputHidden(Vec<u8>),
 }
 
 /// The UI's end of a running session.
@@ -334,6 +384,17 @@ impl Session {
         let bytes = bytes.into();
         if !bytes.is_empty() {
             self.notifier.notify(Msg::Input(bytes));
+        }
+    }
+
+    /// Send input to the program without showing its echo.
+    ///
+    /// For commands catshell types on the user's behalf, which are its plumbing rather
+    /// than part of their session.
+    pub fn write_hidden(&self, bytes: impl Into<Vec<u8>>) {
+        let bytes = bytes.into();
+        if !bytes.is_empty() {
+            self.notifier.notify(Msg::InputHidden(bytes));
         }
     }
 

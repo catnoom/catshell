@@ -1,3 +1,4 @@
+pub mod echo;
 pub mod integration;
 pub mod keys;
 pub mod osc;

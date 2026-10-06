@@ -88,6 +88,13 @@ async fn pump(
                         break ExitReason::Error("the connection dropped while sending".into());
                     }
                 }
+                Some(Msg::InputHidden(bytes)) => {
+                    // Armed before the bytes go out, so the echo cannot beat it back.
+                    feed.suppress_echo(&bytes);
+                    if channel.data(&bytes[..]).await.is_err() {
+                        break ExitReason::Error("the connection dropped while sending".into());
+                    }
+                }
                 Some(Msg::Resize { size, window_size }) => {
                     feed.resize(size, window_size);
                     let _ = channel

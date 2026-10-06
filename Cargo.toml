@@ -47,6 +47,9 @@ bytemuck = { version = "1", features = ["derive"] }
 cosmic-text = "0.19"
 swash = "0.2"
 arboard = "3"
+# Native file dialogs. The Linux default is the XDG portal rather than GTK, so no
+# system development packages are needed to build.
+rfd = "0.17"
 
 catshell-term = { path = "catshell-term" }
 catshell-net = { path = "catshell-net" }

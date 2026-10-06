@@ -25,3 +25,4 @@ bytemuck.workspace = true
 cosmic-text.workspace = true
 swash.workspace = true
 arboard.workspace = true
+rfd.workspace = true

@@ -134,6 +134,15 @@ impl Handler for TestHandler {
         data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        // A line marked this way is echoed back verbatim twice, the way a real
+        // pseudoterminal and readline both echo what is typed at a shell.
+        if data.windows(6).any(|window| window == b"HIDEME") {
+            let text = String::from_utf8_lossy(data).replace('\r', "\r\n");
+            session.data(channel, text.clone().into_bytes())?;
+            session.data(channel, text.into_bytes())?;
+            return Ok(());
+        }
+
         // A crude shell: echo what was typed, and treat "exit" as a request to close.
         if data.starts_with(b"exit") {
             session.exit_status_request(channel, 7)?;
@@ -556,4 +565,45 @@ async fn serve_forever() {
 
     let mut server = TestServer { counts };
     let _ = server.run_on_socket(config, &listener).await;
+}
+
+#[tokio::test]
+async fn a_hidden_command_is_not_shown_over_ssh() {
+    // The SSH driver has to arm the echo filter before the bytes go out, exactly as the
+    // local one does; this is the path that shows catshell's shell-integration snippet
+    // to the user if it gets it wrong.
+    let fixture = Fixture::start("hidden").await;
+    let connection = fixture.connect().await;
+    let session = open_shell(&connection, GridSize::new(100, 24)).await;
+    wait_for(&session, "the banner", |text| text.contains("ready")).await;
+
+    session.write_hidden(b"HIDEME-secret-plumbing\r".to_vec());
+    // Then something visible, to know the hidden write has been through.
+    session.write(b"visible\r".to_vec());
+    wait_for(&session, "the visible echo", |text| {
+        text.contains("echo:visible")
+    })
+    .await;
+
+    let text = screen(&session);
+    assert!(
+        !text.contains("HIDEME"),
+        "the hidden command was shown:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_command_is_still_shown_over_ssh() {
+    // The converse, so the filter cannot be hiding everything.
+    let fixture = Fixture::start("not-hidden").await;
+    let connection = fixture.connect().await;
+    let session = open_shell(&connection, GridSize::new(100, 24)).await;
+    wait_for(&session, "the banner", |text| text.contains("ready")).await;
+
+    session.write(b"HIDEME-but-typed-by-the-user\r".to_vec());
+    let text = wait_for(&session, "the echo", |text| text.contains("HIDEME")).await;
+    assert!(
+        text.contains("HIDEME"),
+        "the user's own command was hidden:\n{text}"
+    );
 }
