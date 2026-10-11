@@ -10,8 +10,15 @@
 //! knows the exact bytes it sent, it can take them back out of the stream before they
 //! reach the grid, so the user never sees the plumbing.
 //!
-//! Matching is literal and exact. Anything else — a reformatted or wrapped echo — simply
-//! fails to match and is shown, which is the old behaviour rather than a new failure.
+//! Matching is literal, with one allowance: in a non-UTF-8 locale readline wraps a long
+//! line by writing the character that lands in the last column, a carriage return, and
+//! then that same character again at the start of the next line. Servers commonly run
+//! with no locale set, so the echo of a snippet long enough to wrap arrives with those
+//! artifacts embedded in it, and a byte-exact matcher would show the user the whole
+//! snippet — the very thing this filter exists to prevent.
+//!
+//! Anything else — a genuinely reformatted echo — simply fails to match and is shown,
+//! which is the old behaviour rather than a new failure.
 
 /// How many copies of a typed line the remote is expected to echo.
 ///
@@ -38,6 +45,9 @@ pub struct EchoFilter {
     /// Whether a line ending is still to be swallowed after a match, so removing the
     /// text does not leave a blank line exactly where it was.
     swallow: Swallow,
+    /// A `\r` withheld mid-match until the next byte says which it was: readline's
+    /// line-wrap artifact, or a carriage return the program really sent.
+    held_carriage_return: bool,
 }
 
 /// How much of the line ending following a match is still to be consumed.
@@ -64,6 +74,7 @@ impl EchoFilter {
             occurrences,
             budget,
             swallow: Swallow::Nothing,
+            held_carriage_return: false,
         }
     }
 
@@ -75,60 +86,102 @@ impl EchoFilter {
     /// Pass `input` through, writing what should be displayed into `out`.
     pub fn filter(&mut self, input: &[u8], out: &mut Vec<u8>) {
         if self.finished() && self.swallow == Swallow::Nothing {
-            out.append(&mut self.held);
+            self.release(out);
             out.extend_from_slice(input);
             return;
         }
 
         for &byte in input {
-            // Checked before `finished`, so the last match's trailing newline goes too.
-            match (self.swallow, byte) {
-                (Swallow::LineEnding, b'\r') => {
-                    self.swallow = Swallow::AfterCarriageReturn;
-                    continue;
-                }
-                (Swallow::LineEnding | Swallow::AfterCarriageReturn, b'\n') => {
-                    self.swallow = Swallow::Nothing;
-                    continue;
-                }
-                (Swallow::LineEnding | Swallow::AfterCarriageReturn, _) => {
-                    self.swallow = Swallow::Nothing;
-                }
-                (Swallow::Nothing, _) => {}
-            }
-
-            if self.finished() {
-                out.push(byte);
-                continue;
-            }
-            self.budget = self.budget.saturating_sub(1);
-
-            if self.pattern[self.held.len()] == byte {
-                self.held.push(byte);
-                if self.held.len() == self.pattern.len() {
-                    self.held.clear();
-                    self.occurrences -= 1;
-                    self.swallow = Swallow::LineEnding;
-                }
-                continue;
-            }
-
-            // The run broke. Emit its first byte and look for a match starting later in
-            // what was held — the text may begin again inside its own near-miss.
-            self.held.push(byte);
-            let mut pending = std::mem::take(&mut self.held);
-            out.push(pending.remove(0));
-            self.resync(pending, out);
+            self.feed(byte, out);
         }
 
         if self.finished() {
-            out.append(&mut self.held);
+            self.release(out);
         }
     }
 
     /// Emit everything still withheld. For when the stream ends mid-candidate.
     pub fn flush(&mut self, out: &mut Vec<u8>) {
+        self.release(out);
+    }
+
+    /// One byte of the stream.
+    ///
+    /// A byte at a time because the input arrives in arbitrary chunks: every decision
+    /// has to survive a split falling anywhere, including between a withheld carriage
+    /// return and the byte that explains it.
+    fn feed(&mut self, byte: u8, out: &mut Vec<u8>) {
+        // Checked before `finished`, so the last match's trailing newline goes too.
+        match (self.swallow, byte) {
+            (Swallow::LineEnding, b'\r') => {
+                self.swallow = Swallow::AfterCarriageReturn;
+                return;
+            }
+            (Swallow::LineEnding | Swallow::AfterCarriageReturn, b'\n') => {
+                self.swallow = Swallow::Nothing;
+                return;
+            }
+            (Swallow::LineEnding | Swallow::AfterCarriageReturn, _) => {
+                self.swallow = Swallow::Nothing;
+            }
+            (Swallow::Nothing, _) => {}
+        }
+
+        if self.finished() {
+            out.push(byte);
+            return;
+        }
+        self.budget = self.budget.saturating_sub(1);
+
+        if self.held_carriage_return {
+            self.held_carriage_return = false;
+            if self.held.last() == Some(&byte) {
+                // readline's wrap: the character that landed in the last column, a
+                // carriage return, then that character again. Neither byte is ours, and
+                // the match carries on across them.
+                return;
+            }
+            // The carriage return was real, so it broke the run like any other byte.
+            // This byte is then considered on its own terms below.
+            self.break_run(b'\r', out);
+        }
+
+        if self.pattern[self.held.len()] == byte {
+            self.held.push(byte);
+            if self.held.len() == self.pattern.len() {
+                self.held.clear();
+                self.occurrences -= 1;
+                self.swallow = Swallow::LineEnding;
+            }
+            return;
+        }
+
+        // Hold a carriage return back instead of deciding now: only the byte after it
+        // says whether this is readline wrapping the line or the program moving the
+        // cursor. Mid-match only — with nothing held there is nothing to wrap.
+        if byte == b'\r' && !self.held.is_empty() {
+            self.held_carriage_return = true;
+            return;
+        }
+
+        self.break_run(byte, out);
+    }
+
+    /// The candidate broke at `byte`. Emit its first byte and look for a match starting
+    /// later in what was held — the text may begin again inside its own near-miss.
+    fn break_run(&mut self, byte: u8, out: &mut Vec<u8>) {
+        self.held.push(byte);
+        let mut pending = std::mem::take(&mut self.held);
+        out.push(pending.remove(0));
+        self.resync(pending, out);
+    }
+
+    /// Give the withheld bytes back, in the order they arrived.
+    fn release(&mut self, out: &mut Vec<u8>) {
         out.append(&mut self.held);
+        if std::mem::take(&mut self.held_carriage_return) {
+            out.push(b'\r');
+        }
     }
 
     /// Find the longest suffix of `pending` that still starts the pattern, emitting what
@@ -151,6 +204,63 @@ impl EchoFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What readline does to a long line in a non-UTF-8 locale: the character that lands
+    /// in the last column is written, then a carriage return, then that same character
+    /// again at the start of the next line.
+    fn wrapped_at(text: &str, column: usize) -> String {
+        let repeated = text.as_bytes()[column - 1] as char;
+        format!("{}\r{}{}", &text[..column], repeated, &text[column..])
+    }
+
+    #[test]
+    fn an_echo_wrapped_by_readline_is_still_removed() {
+        // Observed from a real bash with no locale set: `file://%` `\r` `%s%s`. Without
+        // this the whole snippet is shown, which is what the filter exists to prevent.
+        let pattern = "printf 'file://%s%s' \"$PWD\"";
+        let wrapped = wrapped_at(pattern, 16);
+        assert!(wrapped.contains("%\r%"), "not the artifact: {wrapped:?}");
+        assert_eq!(filter_all_ways(pattern, &wrapped), "");
+    }
+
+    #[test]
+    fn an_echo_wrapped_more_than_once_is_still_removed() {
+        // A long line on a narrow terminal wraps several times.
+        let pattern = "__catshell_report() { printf '\\033]7;file://%s' \"$PWD\"; }";
+        let once = wrapped_at(pattern, 40);
+        let twice = wrapped_at(&once, 20);
+        assert_eq!(filter_all_ways(pattern, &twice), "");
+    }
+
+    #[test]
+    fn a_carriage_return_the_program_sent_is_not_eaten() {
+        // A progress bar returning to the start of the line must survive, so a `\r`
+        // that is not followed by a repeat of the previous character breaks the match
+        // and is shown like anything else.
+        assert_eq!(filter_all_ways("abcdef", "abc\rxyz"), "abc\rxyz");
+    }
+
+    #[test]
+    fn a_carriage_return_is_not_swallowed_when_the_stream_ends_on_it() {
+        // The filter withholds it for one byte to see what follows; if nothing does,
+        // it still has to come out.
+        let mut filter = EchoFilter::new(b"abcdef".to_vec(), 2, DEFAULT_BUDGET);
+        let mut out = Vec::new();
+        filter.filter(b"abc\r", &mut out);
+        filter.flush(&mut out);
+        assert_eq!(String::from_utf8(out).unwrap(), "abc\r");
+    }
+
+    #[test]
+    fn a_wrapped_echo_still_takes_its_line_ending_with_it() {
+        // Otherwise removing the text leaves a blank line exactly where it was.
+        let pattern = "echo hello world";
+        let wrapped = wrapped_at(pattern, 10);
+        assert_eq!(
+            filter_all_ways(pattern, &format!("{wrapped}\r\nnext")),
+            "next"
+        );
+    }
 
     /// Feed the whole input at once.
     fn filter(pattern: &str, input: &str) -> String {

@@ -257,11 +257,29 @@ use catshell_term::integration::{install_command, Shell};
 /// `--norc` keeps the user's own configuration out of it, so the test measures the
 /// snippet rather than whatever is in someone's `.bashrc`.
 fn interactive_bash(size: GridSize) -> Session {
+    interactive_bash_in_locale(size, "C.UTF-8")
+}
+
+/// The same, with the shell's locale pinned.
+///
+/// The locale decides how readline echoes a line too long for the terminal: in a
+/// non-UTF-8 one it rewrites the character at the wrap column, which the echo filter
+/// has to see through. Pinning it means these tests measure that rather than whatever
+/// locale the machine running them happens to have.
+fn interactive_bash_in_locale(size: GridSize, locale: &str) -> Session {
     let options = LocalShellOptions {
         shell: Some((
             "/bin/bash".into(),
             vec!["--norc".into(), "--noprofile".into(), "-i".into()],
         )),
+        env: [
+            ("LANG".to_string(), locale.to_string()),
+            // Set too, or an inherited LC_ALL would override LANG and the locale would
+            // not in fact be pinned.
+            ("LC_ALL".to_string(), locale.to_string()),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     };
     spawn(
@@ -476,6 +494,36 @@ fn the_typed_snippet_is_installed_without_being_shown() {
         "part of the snippet was shown to the user:\n{screen}"
     );
     // And what the user did type is still there.
+    assert!(
+        screen.contains("cd /tmp"),
+        "the user's own command vanished:\n{screen}"
+    );
+}
+
+#[test]
+fn the_typed_snippet_is_hidden_in_a_locale_without_utf8() {
+    // Servers commonly run with no locale set, and bash then echoes a wrapping line by
+    // rewriting the character at the wrap column — `file://%` `\r` `%s%s`. A matcher
+    // that insisted on the exact bytes would show the user the whole snippet, which is
+    // the complaint the filter was written to answer.
+    let session = interactive_bash_in_locale(GridSize::new(100, 24), "C");
+    session.write_hidden(install_command(Shell::Bash).into_bytes());
+    session.write(b"cd /tmp\n".to_vec());
+
+    let events = wait_for_shell_events(&session, "a cwd report from /tmp", |seen| {
+        latest_cwd(seen) == Some("/tmp")
+    });
+    assert_eq!(latest_cwd(&events), Some("/tmp"));
+
+    let screen = screen(&session);
+    assert!(
+        !screen.contains("__catshell_report"),
+        "the snippet was shown to the user:\n{screen}"
+    );
+    assert!(
+        !screen.contains("PROMPT_COMMAND"),
+        "part of the snippet was shown to the user:\n{screen}"
+    );
     assert!(
         screen.contains("cd /tmp"),
         "the user's own command vanished:\n{screen}"
