@@ -59,14 +59,17 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            test: true
           - name: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            test: true
           # macos-latest runners are Apple Silicon, so this is a native build. Intel Macs
           # need an x86_64-apple-darwin entry; Rosetta cannot run an arm64 binary.
           - name: macOS arm64
             os: macos-latest
             target: aarch64-apple-darwin
+            test: false
 
     steps:
       - uses: actions/checkout@v5
@@ -79,6 +82,12 @@ jobs:
       - uses: ./.github/actions/cargo-cache
         with:
           key: release-${{ matrix.target }}
+
+      # A tag should not publish binaries built from code whose tests fail, and a
+      # release can be cut from a commit CI never saw.
+      - name: Test
+        if: matrix.test
+        run: cargo test --workspace --locked
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --package catshell
