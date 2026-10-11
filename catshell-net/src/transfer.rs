@@ -717,6 +717,10 @@ mod tests {
         assert!(expand_local(&dir.0, "/srv/empty").unwrap().is_empty());
     }
 
+    // Creating a symlink on Windows needs either developer mode or elevation, so the
+    // behaviour is exercised where a test can set one up unprivileged. The code under
+    // test is not platform-specific.
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_not_followed() {
         // Following one can copy a whole filesystem, or loop forever.

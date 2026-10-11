@@ -14,7 +14,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/cache@v4
+    - uses: actions/cache@v5
       with:
         # ~/.cargo in full would also cache the toolchain and the registry's extracted
         # sources, which are larger than they are slow to recreate.

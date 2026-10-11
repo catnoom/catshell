@@ -722,6 +722,9 @@ async fn a_failed_operation_is_reported_rather_than_silently_dropped() {
     assert!(!message.is_empty());
 }
 
+// Creating a symlink on Windows needs either developer mode or elevation, so this runs
+// where a test can set one up unprivileged.
+#[cfg(unix)]
 #[tokio::test]
 async fn symlinks_are_reported_as_links_not_as_their_targets() {
     let fixture = Fixture::start("symlink").await;

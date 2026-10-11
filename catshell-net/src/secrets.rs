@@ -43,8 +43,21 @@ pub fn set(account: &str, secret: &str) -> bool {
 }
 
 /// Forget a stored secret. Succeeds if there was nothing to forget.
+///
+/// Opening the store is kept separate from the deletion so the two failures can be told
+/// apart. A store that cannot be opened at all holds nothing of ours, so there is
+/// nothing left to forget; a store we did open and which then refused the deletion is a
+/// real failure the UI should hear about.
 pub fn delete(account: &str) -> bool {
-    match keyring::Entry::new(SERVICE, account).and_then(|entry| entry.delete_credential()) {
+    let entry = match keyring::Entry::new(SERVICE, account) {
+        Ok(entry) => entry,
+        Err(err) => {
+            tracing::debug!("credential store unavailable, nothing to forget: {err}");
+            return true;
+        }
+    };
+
+    match entry.delete_credential() {
         Ok(()) => true,
         Err(keyring::Error::NoEntry) => true,
         Err(err) => {
