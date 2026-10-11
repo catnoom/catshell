@@ -15,6 +15,7 @@ use catshell_net::connection::{AuthMethod, ConnectError, ConnectOptions, HostCon
 use catshell_net::host::{HostStore, ListedHost};
 use catshell_net::known_hosts::UnknownHostPolicy;
 use catshell_net::sftp::SftpBrowser;
+use catshell_net::transfer::TransferQueue;
 use catshell_net::{host, secrets, shell, HostConfig};
 use catshell_term::palette::Palette;
 use catshell_term::session::{GridSize, Session, Wakeup};
@@ -76,6 +77,14 @@ pub struct SshManager {
     browsers: HashMap<String, SftpBrowser>,
     /// Hosts whose browser is being opened, so it is not opened twice.
     opening_browsers: std::collections::HashSet<String>,
+    /// One transfer queue per host, on that host's *second* connection.
+    transfers: HashMap<String, TransferQueue>,
+    /// The options each host was reached with, so a second connection can be made
+    /// without asking the user to authenticate again.
+    ///
+    /// This keeps a password in memory for the life of the session — it already was, to
+    /// make the first connection — but it is worth being explicit that it is retained.
+    credentials: HashMap<String, Arc<ConnectOptions>>,
     /// Hosts whose browser became available since the last drain.
     ///
     /// Opening is asynchronous, so anything requested in the meantime was dropped on the
@@ -108,6 +117,8 @@ impl SshManager {
             browsers: HashMap::new(),
             opening_browsers: std::collections::HashSet::new(),
             ready_browsers: Vec::new(),
+            transfers: HashMap::new(),
+            credentials: HashMap::new(),
             pending: HashMap::new(),
             results: std::sync::mpsc::channel(),
         })
@@ -271,6 +282,10 @@ impl SshManager {
             options.methods.push(AuthMethod::Password(stored));
         }
 
+        // Kept so a second connection for transfers needs no further prompting.
+        self.credentials
+            .insert(host.name.clone(), Arc::new(options.clone()));
+
         let results = self.results.0.clone();
         self.runtime.spawn(async move {
             let attempt = match HostConnection::connect(options).await {
@@ -315,6 +330,51 @@ impl SshManager {
         });
     }
 
+    /// Hosts that have a transfer queue open.
+    pub fn hosts_with_transfers(&self) -> Vec<String> {
+        self.transfers.keys().cloned().collect()
+    }
+
+    /// A host's transfer queue, if one is open.
+    pub fn transfers(&self, host: &str) -> Option<&TransferQueue> {
+        self.transfers.get(host)
+    }
+
+    /// Open a host's transfer queue, which connects on its own.
+    ///
+    /// A second connection, deliberately: SSH channels share one TCP stream, so running
+    /// a large transfer beside the shells would put every keystroke behind it. The queue
+    /// makes that connection when it first has work and drops it again once it has been
+    /// idle, so a session that never transfers anything never opens one.
+    pub fn open_transfers(&mut self, host: &str, wakeup: Option<Wakeup>) {
+        if self.transfers.contains_key(host) {
+            return;
+        }
+        let Some(options) = self.credentials.get(host).cloned() else {
+            return;
+        };
+
+        // The same credentials as the first connection, so no second prompt — and the
+        // queue can reconnect by itself after an idle period without asking again.
+        let connect: catshell_net::transfer::Connector = Arc::new(move || {
+            let options = options.as_ref().clone();
+            Box::pin(async move {
+                HostConnection::connect(options)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        });
+
+        // `TransferQueue::new` spawns its worker, which needs the runtime in scope.
+        let _guard = self.runtime.enter();
+        let queue = TransferQueue::new(
+            connect,
+            catshell_net::transfer::DEFAULT_IDLE_TIMEOUT,
+            wakeup.map(|w| w as catshell_net::transfer::Wakeup),
+        );
+        self.transfers.insert(host.to_string(), queue);
+    }
+
     /// Hosts whose browser has just become usable, taken once.
     pub fn take_ready_browsers(&mut self) -> Vec<String> {
         std::mem::take(&mut self.ready_browsers)
@@ -327,6 +387,9 @@ impl SshManager {
 
     /// Open a file browser for a host, if the connection is up and there is not one
     /// already.
+    ///
+    /// On the host's *existing* connection, unlike transfers: the explorer has to see
+    /// the same session as the shells for following the terminal to mean anything.
     pub fn open_browser(&mut self, host: &str, wakeup: Option<Wakeup>) {
         if self.browsers.contains_key(host) || self.opening_browsers.contains(host) {
             return;
@@ -345,13 +408,7 @@ impl SshManager {
             let attempt = match SftpBrowser::open(connection, wakeup).await {
                 Ok(browser) => Attempt::BrowserReady { host, browser },
                 Err(err) => Attempt::ShellFailed {
-                    host: HostConfig {
-                        name: host,
-                        hostname: String::new(),
-                        port: 0,
-                        user: None,
-                        identity_files: vec![],
-                    },
+                    host: placeholder_host(host),
                     message: format!("opening the file browser: {err:#}"),
                 },
             };
@@ -377,6 +434,7 @@ impl SshManager {
             .collect();
 
         self.browsers.clear();
+        self.transfers.clear();
         self.runtime.block_on(async {
             for connection in connections {
                 connection.disconnect().await;
@@ -409,6 +467,18 @@ async fn open_shell(
         request.wakeup.clone(),
     )
     .await
+}
+
+/// A `HostConfig` carrying only a name, for reporting a failure against a host whose
+/// full definition is not to hand.
+fn placeholder_host(name: String) -> HostConfig {
+    HostConfig {
+        name,
+        hostname: String::new(),
+        port: 0,
+        user: None,
+        identity_files: Vec::new(),
+    }
 }
 
 /// Decide what to ask the user about a failed attempt.

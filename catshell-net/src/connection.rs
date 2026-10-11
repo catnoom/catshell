@@ -84,6 +84,10 @@ impl ConnectError {
 }
 
 /// Everything needed to establish a connection, gathered before any I/O.
+///
+/// Cloneable so a second connection — the one bulk transfers use — can be made with the
+/// same credentials rather than prompting again.
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub host: HostConfig,
     /// Tried in order; the first that succeeds wins.

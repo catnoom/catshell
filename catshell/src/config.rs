@@ -10,6 +10,32 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub font: FontConfig,
     pub terminal: TerminalConfig,
+    pub transfer: TransferConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransferConfig {
+    /// Where downloads are written. Unset uses the system Downloads folder.
+    pub download_dir: Option<PathBuf>,
+}
+
+impl TransferConfig {
+    /// The folder downloads land in.
+    ///
+    /// The system Downloads folder rather than the process's working directory: for an
+    /// application started from a launcher that working directory is arbitrary — `/`, or
+    /// wherever the launcher happened to be — and a file that lands somewhere arbitrary
+    /// is a file the user has to go hunting for.
+    pub fn destination(&self) -> PathBuf {
+        self.download_dir
+            .clone()
+            .or_else(dirs::download_dir)
+            // A system with no Downloads folder configured would otherwise drop files
+            // straight into the home directory, which is nobody's idea of tidy.
+            .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +162,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloads_default_to_a_folder_the_user_can_find() {
+        let destination = TransferConfig::default().destination();
+        assert!(
+            destination.is_absolute(),
+            "downloads would go somewhere relative: {destination:?}"
+        );
+        // Specifically *not* wherever the app happened to be started from.
+        if let Ok(cwd) = std::env::current_dir() {
+            if dirs::download_dir().is_some() || dirs::home_dir().is_some() {
+                assert_ne!(
+                    destination, cwd,
+                    "downloads default to the launch directory, which is arbitrary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn downloads_never_land_loose_in_the_home_directory() {
+        let destination = TransferConfig::default().destination();
+        if let Some(home) = dirs::home_dir() {
+            assert_ne!(
+                destination, home,
+                "downloads would be dropped straight into the home directory"
+            );
+        }
+    }
+
+    #[test]
+    fn the_download_folder_can_be_configured() {
+        let parsed: Config =
+            toml::from_str("[transfer]\ndownload_dir = \"/srv/incoming\"\n").unwrap();
+        assert_eq!(
+            parsed.transfer.destination(),
+            PathBuf::from("/srv/incoming")
+        );
+    }
 
     #[test]
     fn defaults_round_trip_through_toml() {

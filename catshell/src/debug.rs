@@ -33,6 +33,11 @@ pub struct ScreenshotRequest {
     pub open_host_editor: bool,
     /// Also open the key-file dialog, to check it does not block the frame loop.
     pub open_file_picker: bool,
+    /// Name of a remote file to download, to exercise the transfer queue.
+    pub download: Option<String>,
+    /// Extra seconds to stay open before capturing, for watching behaviour that is
+    /// driven by a timer rather than by input.
+    pub linger: Option<u64>,
 }
 
 /// Which way to split, kept separate from the app's own `Direction` so this debug-only
@@ -67,6 +72,10 @@ impl ScreenshotRequest {
             trust_host: std::env::var("CATSHELL_TRUST").is_ok_and(|value| value != "0"),
             open_host_editor: std::env::var("CATSHELL_HOST_EDITOR").is_ok(),
             open_file_picker: std::env::var("CATSHELL_PICK_KEY").is_ok(),
+            download: std::env::var("CATSHELL_DOWNLOAD").ok(),
+            linger: std::env::var("CATSHELL_LINGER")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         })
     }
 }
@@ -94,8 +103,9 @@ pub struct Screenshotter {
 
 impl Screenshotter {
     pub fn new(request: ScreenshotRequest) -> Self {
+        let linger = request.linger.map(Duration::from_secs).unwrap_or_default();
         Self {
-            deadline: Instant::now() + SETTLE,
+            deadline: Instant::now() + SETTLE + linger,
             request,
             splits_done: false,
             connect_done: false,
@@ -128,6 +138,11 @@ impl Screenshotter {
         let wanted = self.request.open_host_editor;
         self.request.open_host_editor = false;
         wanted
+    }
+
+    /// The remote file to download, the first time this is asked.
+    pub fn take_download(&mut self) -> Option<String> {
+        self.request.download.take()
     }
 
     /// Whether the key-file dialog should be opened, the first time this is asked.

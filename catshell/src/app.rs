@@ -170,6 +170,44 @@ fn unique_name(base: &str, existing: &[catshell_net::host::ListedHost]) -> Strin
         .unwrap_or_else(|| base.to_string())
 }
 
+/// One line in the transfer panel.
+struct TransferRow {
+    id: catshell_net::transfer::JobId,
+    host: String,
+    name: String,
+    direction: catshell_net::transfer::Direction,
+    total: u64,
+    transferred: u64,
+    state: TransferState,
+    /// Kept so a stopped transfer can be picked up where it left off.
+    local: std::path::PathBuf,
+    remote: String,
+}
+
+#[derive(PartialEq, Eq)]
+enum TransferState {
+    Queued,
+    Running,
+    Finished,
+    Cancelled,
+    Failed(String),
+}
+
+impl TransferRow {
+    fn is_active(&self) -> bool {
+        matches!(self.state, TransferState::Queued | TransferState::Running)
+    }
+
+    /// How far along, as a fraction. An unknown or zero total counts as complete, so an
+    /// empty file does not sit at nothing forever.
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        (self.transferred as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+    }
+}
+
 /// A file operation the user has started but not yet confirmed.
 ///
 /// Held as state rather than done immediately, because each needs either a name or an
@@ -260,6 +298,17 @@ pub struct App {
     show_explorer: bool,
     /// A file operation awaiting a name or a confirmation.
     file_op: Option<FileOp>,
+    /// What the transfer panel shows, newest first.
+    transfers: Vec<TransferRow>,
+    show_transfers: bool,
+    /// A folder dialog in progress, with the entry it will download.
+    download_picker: Option<(
+        FileEntry,
+        std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    )>,
+    /// Transfers waiting for a host's bulk connection to finish opening.
+    pending_uploads: Vec<(String, String, Vec<std::path::PathBuf>)>,
+    pending_downloads: Vec<(String, String, std::path::PathBuf, u64)>,
     /// The host being added or edited, if any.
     host_editor: Option<HostEditor>,
     /// A question the user has to answer before a connection can continue.
@@ -319,6 +368,11 @@ impl App {
             // and an SFTP channel only once a remote pane has focus.
             show_explorer: true,
             file_op: None,
+            transfers: Vec::new(),
+            show_transfers: false,
+            download_picker: None,
+            pending_uploads: Vec::new(),
+            pending_downloads: Vec::new(),
             host_editor: None,
             prompt: None,
             password: String::new(),
@@ -468,6 +522,7 @@ impl App {
                     self.password.clear();
                 }
                 // Consumed inside the manager; it never reaches here.
+                // Taken out inside the manager before it reaches here.
                 Attempt::BrowserReady { .. } => {}
                 Attempt::ShellFailed { host, message } => {
                     self.status = Some(format!("{}: {message}", host.name));
@@ -634,6 +689,10 @@ impl App {
         let mut activate: Option<FileEntry> = None;
         let mut select: Option<String> = None;
         let (mut new_folder, mut rename, mut delete) = (false, false, false);
+        let mut download = false;
+        let mut download_to = false;
+        let remote = explorer.source().is_remote();
+        let destination = self.config.transfer.destination();
         let selection: Option<FileEntry> = explorer
             .selected()
             .and_then(|name| explorer.visible().find(|entry| entry.name == name).cloned());
@@ -673,6 +732,29 @@ impl App {
                 .clicked()
             {
                 delete = true;
+            }
+            if remote
+                && ui
+                    .add_enabled(
+                        selection.is_some(),
+                        egui::Button::small(egui::Button::new("Download")),
+                    )
+                    // Named in the tooltip, so where a file lands is never a mystery.
+                    .on_hover_text(format!("Copy into {}", destination.display()))
+                    .clicked()
+            {
+                download = true;
+            }
+            if remote
+                && ui
+                    .add_enabled(
+                        selection.is_some(),
+                        egui::Button::small(egui::Button::new("Download to…")),
+                    )
+                    .on_hover_text("Choose a folder")
+                    .clicked()
+            {
+                download_to = true;
             }
         });
 
@@ -773,6 +855,15 @@ impl App {
                     name: entry.name.clone(),
                     kind: entry.kind,
                 });
+            }
+            if download {
+                let into = self.config.transfer.destination();
+                let entry = entry.clone();
+                self.download_selection(&entry, into);
+            }
+            if download_to {
+                let entry = entry.clone();
+                self.pick_download_folder(entry);
             }
         }
 
@@ -954,6 +1045,124 @@ impl App {
                     editor.error = Some(format!("could not save: {err}"));
                 }
             }
+        }
+    }
+
+    /// Draw the transfer queue.
+    fn show_transfers(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Transfers");
+            let active = self.transfers.iter().filter(|row| row.is_active()).count();
+            if active > 0 {
+                ui.label(format!("{active} running"));
+            }
+            if ui.small_button("Clear finished").clicked() {
+                self.transfers.retain(TransferRow::is_active);
+            }
+        });
+        ui.separator();
+
+        if self.transfers.is_empty() {
+            ui.label("Drop files onto the file pane to upload them.");
+            return;
+        }
+
+        let mut cancel = None;
+        let mut resume = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for row in &self.transfers {
+                ui.horizontal(|ui| {
+                    ui.label(row.direction.verb());
+                    ui.strong(&row.name);
+                    // The full destination, so a finished transfer never leaves anyone
+                    // wondering where the file actually went.
+                    let destination = match row.direction {
+                        catshell_net::transfer::Direction::Download => {
+                            row.local.display().to_string()
+                        }
+                        catshell_net::transfer::Direction::Upload => {
+                            format!("{} on {}", row.remote, row.host)
+                        }
+                    };
+                    ui.label(egui::RichText::new(format!("to {destination}")).small())
+                        .on_hover_text(&destination);
+                });
+
+                match &row.state {
+                    TransferState::Failed(message) => {
+                        ui.colored_label(Color32::from_rgb(0xd5, 0x4e, 0x53), message);
+                    }
+                    TransferState::Cancelled => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "stopped after {}",
+                                    explorer::human_size(row.transferred)
+                                ))
+                                .small(),
+                            );
+                            // Safe to offer here and nowhere else: this transfer wrote
+                            // the partial file itself, so it is known to be a prefix of
+                            // the source.
+                            if ui.small_button("Resume").clicked() {
+                                resume = Some((
+                                    row.host.clone(),
+                                    row.direction,
+                                    row.local.clone(),
+                                    row.remote.clone(),
+                                    row.total,
+                                ));
+                            }
+                        });
+                    }
+                    TransferState::Finished => {
+                        ui.label(egui::RichText::new(explorer::human_size(row.total)).small());
+                    }
+                    TransferState::Queued | TransferState::Running => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(row.fraction())
+                                    .desired_width(160.0)
+                                    .text(format!(
+                                        "{} / {}",
+                                        explorer::human_size(row.transferred),
+                                        explorer::human_size(row.total)
+                                    )),
+                            );
+                            if ui.small_button("Cancel").clicked() {
+                                cancel = Some((row.host.clone(), row.id));
+                            }
+                        });
+                    }
+                }
+                ui.separator();
+            }
+        });
+
+        if let Some((host, id)) = cancel {
+            if let Some(queue) = self.ssh.transfers(&host) {
+                queue.cancel(id);
+            }
+        }
+        if let Some((host, direction, local, remote, total)) = resume {
+            if let Some(queue) = self.ssh.transfers(&host) {
+                queue.resume(direction, local, remote, total);
+            }
+        }
+    }
+
+    /// Queue uploads for anything dropped onto the window.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.upload_to_explorer(dropped);
         }
     }
 
@@ -1408,6 +1617,225 @@ impl App {
         });
     }
 
+    /// Apply whatever the transfer queues have reported.
+    fn drain_transfers(&mut self) {
+        use catshell_net::transfer::Event as TransferEvent;
+
+        let hosts: Vec<String> = self.ssh.hosts_with_transfers();
+        for host in hosts {
+            let Some(queue) = self.ssh.transfers(&host) else {
+                continue;
+            };
+            for event in queue.drain() {
+                match event {
+                    TransferEvent::Queued { job } => {
+                        self.transfers.insert(
+                            0,
+                            TransferRow {
+                                id: job.id,
+                                host: host.clone(),
+                                name: job.name(),
+                                direction: job.direction,
+                                total: job.size,
+                                transferred: 0,
+                                state: TransferState::Queued,
+                                local: job.local.clone(),
+                                remote: job.remote.clone(),
+                            },
+                        );
+                        // A transfer the user cannot see is a transfer they cannot stop.
+                        self.show_transfers = true;
+                    }
+                    TransferEvent::Started { id } => {
+                        self.update_transfer(&host, id, |row| row.state = TransferState::Running);
+                    }
+                    TransferEvent::Progress { id, transferred } => {
+                        self.update_transfer(&host, id, |row| row.transferred = transferred);
+                    }
+                    TransferEvent::Finished { id } => {
+                        self.update_transfer(&host, id, |row| {
+                            row.transferred = row.total;
+                            row.state = TransferState::Finished;
+                        });
+                        self.refresh_explorer_for(&host);
+                    }
+                    TransferEvent::Cancelled { id } => {
+                        self.update_transfer(&host, id, |row| {
+                            row.state = TransferState::Cancelled;
+                        });
+                    }
+                    TransferEvent::Failed { id, message } => {
+                        self.update_transfer(&host, id, |row| {
+                            row.state = TransferState::Failed(message.clone());
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_transfer(
+        &mut self,
+        host: &str,
+        id: catshell_net::transfer::JobId,
+        change: impl FnOnce(&mut TransferRow),
+    ) {
+        if let Some(row) = self
+            .transfers
+            .iter_mut()
+            .find(|row| row.id == id && row.host == host)
+        {
+            change(row);
+        }
+    }
+
+    /// Re-list the explorer if it is showing the host a transfer just changed.
+    fn refresh_explorer_for(&mut self, host: &str) {
+        let showing = matches!(
+            self.explorer.as_ref().map(Explorer::source),
+            Some(Source::Remote(shown)) if shown == host
+        );
+        if !showing {
+            return;
+        }
+        if let Some(explorer) = &mut self.explorer {
+            let action = explorer.reload();
+            self.run_explorer_action(action);
+        }
+    }
+
+    /// Queue an upload of local paths into the directory the explorer is showing.
+    fn upload_to_explorer(&mut self, paths: Vec<std::path::PathBuf>) {
+        let Some(explorer) = &self.explorer else {
+            return;
+        };
+        let Source::Remote(host) = explorer.source().clone() else {
+            self.status = Some("the file pane is showing this machine, not a host".into());
+            return;
+        };
+        let destination = explorer.path().to_string();
+
+        // Opened on first use; the jobs are queued either way and run once it is ready.
+        self.ssh
+            .open_transfers(&host, Some(Arc::clone(&self.wakeup)));
+        self.pending_uploads.push((host, destination, paths));
+    }
+
+    /// Start any uploads that were waiting for a transfer queue to open.
+    fn flush_pending_uploads(&mut self) {
+        let ready: Vec<_> = std::mem::take(&mut self.pending_uploads);
+        for (host, destination, paths) in ready {
+            let Some(queue) = self.ssh.transfers(&host) else {
+                // Still opening; try again next frame.
+                self.pending_uploads.push((host, destination, paths));
+                continue;
+            };
+
+            for path in paths {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let root = catshell_net::files::posix::join(&destination, &name);
+
+                // A directory becomes one job per file in it, so progress is honest
+                // rather than a single bar that sits still until the end.
+                match catshell_net::transfer::expand_local(&path, &root) {
+                    Ok(files) => {
+                        for (local, remote, size) in files {
+                            queue.enqueue(
+                                catshell_net::transfer::Direction::Upload,
+                                local,
+                                remote,
+                                size,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        self.status = Some(format!("{}: {err}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask for a folder, then download the selection into it.
+    ///
+    /// On its own thread for the same reason as the key-file dialog: `rfd` blocks until
+    /// the user chooses, and blocking here would freeze the frame loop.
+    fn pick_download_folder(&mut self, entry: FileEntry) {
+        if self.download_picker.is_some() {
+            return;
+        }
+        let start = self.config.transfer.destination();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.download_picker = Some((entry, receiver));
+
+        std::thread::Builder::new()
+            .name("catshell-folder-dialog".into())
+            .spawn(move || {
+                let folder = rfd::FileDialog::new()
+                    .set_title("Download into")
+                    .set_directory(start)
+                    .pick_folder();
+                let _ = sender.send(folder);
+            })
+            .ok();
+    }
+
+    /// Start the download once a folder has been chosen.
+    fn poll_download_picker(&mut self, ctx: &egui::Context) {
+        let Some((_, receiver)) = &self.download_picker else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(chosen) => {
+                let (entry, _) = self.download_picker.take().expect("just checked");
+                if let Some(folder) = chosen {
+                    self.download_selection(&entry, folder);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.download_picker = None;
+            }
+            // Still open; keep painting so the answer is noticed.
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+        }
+    }
+
+    /// Download the explorer's selection to a local directory.
+    fn download_selection(&mut self, entry: &FileEntry, into: std::path::PathBuf) {
+        let Some(explorer) = &self.explorer else {
+            return;
+        };
+        let Source::Remote(host) = explorer.source().clone() else {
+            return;
+        };
+        let remote = explorer.path_of(&entry.name);
+
+        self.ssh
+            .open_transfers(&host, Some(Arc::clone(&self.wakeup)));
+        self.pending_downloads
+            .push((host, remote, into.join(&entry.name), entry.size));
+    }
+
+    /// Start any downloads that were waiting for a transfer queue to open.
+    fn flush_pending_downloads(&mut self) {
+        let ready: Vec<_> = std::mem::take(&mut self.pending_downloads);
+        for (host, remote, local, size) in ready {
+            let Some(queue) = self.ssh.transfers(&host) else {
+                self.pending_downloads.push((host, remote, local, size));
+                continue;
+            };
+            queue.enqueue(
+                catshell_net::transfer::Direction::Download,
+                local,
+                remote,
+                size,
+            );
+        }
+    }
+
     /// Apply whatever the file browsers have reported.
     fn drain_browsers(&mut self) {
         let Some(explorer) = &self.explorer else {
@@ -1603,6 +2031,35 @@ impl App {
         if shot.take_open_host_editor() {
             self.host_editor = Some(HostEditor::new(HostEditor::blank(), false));
         }
+        // Only once the explorer is showing the *host* and has a listing. At startup it
+        // shows this machine, and firing then would look for the file in the wrong
+        // filesystem.
+        let listed = self.explorer.as_ref().is_some_and(|explorer| {
+            explorer.source().is_remote() && explorer.visible().next().is_some()
+        });
+        if listed {
+            if let Some(name) = self
+                .screenshotter
+                .as_mut()
+                .and_then(Screenshotter::take_download)
+            {
+                let entry = self
+                    .explorer
+                    .as_ref()
+                    .and_then(|explorer| explorer.visible().find(|e| e.name == name).cloned());
+                match entry {
+                    Some(entry) => {
+                        let into = self.config.transfer.destination();
+                        self.download_selection(&entry, into);
+                        if let Some(shot) = &mut self.screenshotter {
+                            shot.extend(std::time::Duration::from_millis(3000));
+                        }
+                    }
+                    None => self.status = Some(format!("no such file: {name}")),
+                }
+            }
+        }
+
         let pick = self
             .screenshotter
             .as_mut()
@@ -1890,6 +2347,13 @@ impl App {
             {
                 self.show_explorer = !self.show_explorer;
             }
+            if ui
+                .selectable_label(self.show_transfers, "Transfers")
+                .on_hover_text("Show or hide the transfer queue")
+                .clicked()
+            {
+                self.show_transfers = !self.show_transfers;
+            }
             if ui.small_button("+").clicked() {
                 if let Err(err) = self.new_tab() {
                     self.status = Some(format!("{err}"));
@@ -1910,6 +2374,16 @@ impl eframe::App for App {
         self.drain_sessions();
         self.drain_ssh();
         self.retarget_explorer();
+        self.drain_transfers();
+        self.flush_pending_uploads();
+        self.flush_pending_downloads();
+        self.poll_download_picker(&ctx);
+        self.handle_dropped_files(&ctx);
+
+        // Keep painting while anything is moving, so progress bars advance.
+        if self.transfers.iter().any(TransferRow::is_active) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // A browser that has just opened may have missed the request that triggered it,
         // since opening is asynchronous; ask again now that it can answer.
@@ -1951,6 +2425,11 @@ impl eframe::App for App {
             egui::Panel::left("catshell hosts")
                 .resizable(true)
                 .show(ui, |ui| self.show_host_list(ui));
+        }
+        if self.show_transfers {
+            egui::Panel::bottom("catshell transfers")
+                .resizable(true)
+                .show(ui, |ui| self.show_transfers(ui));
         }
         if self.show_explorer {
             egui::Panel::right("catshell files")
@@ -2460,6 +2939,49 @@ mod tests {
             !ctx.text_edit_focused(),
             "a focused pane must not look like a text field"
         );
+    }
+
+    fn row(total: u64, transferred: u64, state: TransferState) -> TransferRow {
+        TransferRow {
+            id: 1,
+            host: "web".into(),
+            name: "file.bin".into(),
+            direction: catshell_net::transfer::Direction::Upload,
+            total,
+            transferred,
+            state,
+            local: std::path::PathBuf::from("/tmp/file.bin"),
+            remote: "/srv/file.bin".into(),
+        }
+    }
+
+    #[test]
+    fn progress_is_a_fraction_of_the_total() {
+        assert_eq!(row(100, 0, TransferState::Running).fraction(), 0.0);
+        assert_eq!(row(100, 50, TransferState::Running).fraction(), 0.5);
+        assert_eq!(row(100, 100, TransferState::Running).fraction(), 1.0);
+    }
+
+    #[test]
+    fn an_empty_file_shows_as_complete_rather_than_stuck() {
+        // Dividing by a zero total would leave a bar sitting at nothing forever.
+        assert_eq!(row(0, 0, TransferState::Running).fraction(), 1.0);
+    }
+
+    #[test]
+    fn a_wrong_total_cannot_push_the_bar_past_the_end() {
+        // The size is read before the transfer starts; the file can grow in between.
+        assert_eq!(row(100, 500, TransferState::Running).fraction(), 1.0);
+    }
+
+    #[test]
+    fn only_unfinished_transfers_count_as_active() {
+        // What decides whether the UI keeps repainting, and what "Clear finished" keeps.
+        assert!(row(1, 0, TransferState::Queued).is_active());
+        assert!(row(1, 0, TransferState::Running).is_active());
+        assert!(!row(1, 1, TransferState::Finished).is_active());
+        assert!(!row(1, 0, TransferState::Cancelled).is_active());
+        assert!(!row(1, 0, TransferState::Failed("no".into())).is_active());
     }
 
     #[test]

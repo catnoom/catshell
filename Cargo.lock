@@ -637,6 +637,7 @@ dependencies = [
  "catshell-term",
  "dirs 7.0.0",
  "keyring",
+ "parking_lot",
  "rand",
  "rand_chacha",
  "russh",

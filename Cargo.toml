@@ -12,7 +12,7 @@ repository = "https://github.com/cotterma/catshell"
 alacritty_terminal = "0.26"
 russh = "0.63"
 russh-sftp = "2.4"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
 async-trait = "0.1"
 # Default features select the platform-native store: Keychain on macOS,
 # Credential Manager on Windows, Secret Service on Linux.

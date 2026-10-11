@@ -12,6 +12,7 @@ pub mod known_hosts;
 pub mod secrets;
 pub mod sftp;
 pub mod shell;
+pub mod transfer;
 
 pub use connection::{AuthMethod, ConnectError, ConnectOptions, HostConnection};
 pub use files::{EntryKind, FileEntry};
