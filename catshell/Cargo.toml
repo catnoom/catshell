@@ -3,6 +3,8 @@ name = "catshell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "A terminal and file explorer that share one SSH connection."
 
 [dependencies]
 catshell-term.workspace = true

@@ -6,7 +6,7 @@ members = ["catshell-term", "catshell-net", "catshell"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/cotterma/catshell"
+repository = "https://github.com/catnoom/catshell"
 
 [workspace.dependencies]
 alacritty_terminal = "0.26"
@@ -58,6 +58,9 @@ catshell-net = { path = "catshell-net" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# The debug symbols are most of the binary's size, and the binary is something people
+# download. Backtraces keep their function names; only line numbers are lost.
+strip = "symbols"
 
 [profile.dev]
 opt-level = 1

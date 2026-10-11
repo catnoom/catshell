@@ -1,0 +1,29 @@
+# Caches the registry and the build directory.
+#
+# The key is pinned to Cargo.lock, so a dependency change starts a fresh cache rather
+# than growing a stale one; `restore-keys` still seeds that fresh cache from the previous
+# one so only the changed crates are rebuilt.
+name: Cargo cache
+description: Restores the cargo registry and target directory for this job.
+
+inputs:
+  key:
+    description: Distinguishes caches between jobs that compile with different flags.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v4
+      with:
+        # ~/.cargo in full would also cache the toolchain and the registry's extracted
+        # sources, which are larger than they are slow to recreate.
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ inputs.key }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ inputs.key }}-
+          ${{ runner.os }}-cargo-

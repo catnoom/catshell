@@ -1,0 +1,213 @@
+# Builds the downloadable binaries and publishes them as a GitHub release.
+#
+# Pushing a tag like `v0.1.0` publishes. Running it by hand from the Actions tab builds
+# and packages everything but publishes nothing, so the pipeline can be rehearsed without
+# spending a version number on it; the archives are left as workflow artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fails before three builds start if the tag and the manifest disagree, which would
+  # otherwise ship a `v0.2.0` download whose `--version` says 0.1.0.
+  version:
+    name: Resolve the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve and check the version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$manifest" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $manifest. Set version in Cargo.toml to ${GITHUB_REF_NAME#v}, or retag as v$manifest."
+              exit 1
+            fi
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$manifest"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every platform's result is wanted, not just the first failure's.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 sets the oldest glibc the Linux download will run against. Building on
+          # `latest` would produce a binary that refuses to start on any distribution
+          # shipping something older than Ubuntu 24.04's glibc.
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # macos-latest runners are Apple Silicon, so this is a native build. Intel Macs
+          # need an x86_64-apple-darwin entry; Rosetta cannot run an arm64 binary.
+          - name: macOS arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} --no-self-update
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --package catshell
+
+      # Proves the artifact actually starts. --version returns before any window is
+      # opened, which is what makes this runnable on a machine with no display.
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/catshell"
+          if [ "${{ runner.os }}" = Windows ]; then
+            binary="$binary.exe"
+          fi
+          version="${{ needs.version.outputs.version }}"
+          reported="$("$binary" --version)"
+          echo "$reported"
+          if [ "$reported" != "catshell ${version#v}" ]; then
+            echo "::error::Binary reports '$reported', expected 'catshell ${version#v}'"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="catshell-${{ needs.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$staging"
+
+          if [ "${{ runner.os }}" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/catshell.exe" "dist/$staging/"
+          else
+            cp "target/${{ matrix.target }}/release/catshell" "dist/$staging/"
+          fi
+
+          # Picked up if and when they exist, so adding a README later needs no change
+          # here.
+          for extra in README.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+            if [ -f "$extra" ]; then
+              cp "$extra" "dist/$staging/"
+            fi
+          done
+
+          if [ "${{ runner.os }}" = Windows ]; then
+            # Windows has no tar-aware file manager; a zip opens with a double click.
+            (cd dist && 7z a -tzip "$staging.zip" "$staging" >/dev/null)
+            echo "asset=dist/$staging.zip" >> "$GITHUB_ENV"
+          else
+            tar -C dist -czf "dist/$staging.tar.gz" "$staging"
+            echo "asset=dist/$staging.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catshell-${{ matrix.target }}
+          path: ${{ env.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [version, build]
+    # Only a tag publishes. A manual run stops here, having proved the builds work.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create writes to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The whole history, so the notes can name the previous tag.
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: catshell-*
+          merge-multiple: true
+
+      - name: Checksum the archives
+        working-directory: artifacts
+        run: sha256sum * | tee SHA256SUMS
+
+      - name: Write the release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Downloads"
+            echo
+            echo "| Platform | File |"
+            echo "| --- | --- |"
+            echo "| Linux (x86_64, glibc 2.35+) | \`catshell-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` |"
+            echo "| Windows (x86_64) | \`catshell-$VERSION-x86_64-pc-windows-msvc.zip\` |"
+            echo "| macOS (Apple Silicon) | \`catshell-$VERSION-aarch64-apple-darwin.tar.gz\` |"
+            echo
+            echo "Unpack and run \`catshell\`. There is nothing to install."
+            echo
+            echo "On macOS the binary is unsigned, so Gatekeeper blocks the first run:"
+            echo "\`xattr -d com.apple.quarantine catshell\` clears it."
+            echo
+            echo "Verify a download against \`SHA256SUMS\`:"
+            echo
+            echo '```'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo '```'
+            echo
+
+            previous="$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || true)"
+            if [ -n "$previous" ]; then
+              echo "## Changes since $previous"
+              echo
+              git log --no-merges --pretty='- %s' "$previous..$VERSION"
+              echo
+              echo "**Full diff**: https://github.com/${{ github.repository }}/compare/$previous...$VERSION"
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # One call with every asset, so the release is never visible half-uploaded.
+          gh release create "$VERSION" \
+            --title "catshell $VERSION" \
+            --notes-file notes.md \
+            --verify-tag \
+            artifacts/*
