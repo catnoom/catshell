@@ -1,0 +1,87 @@
+# Checks every push and pull request on the three platforms catshell ships binaries for.
+#
+# Tests run on Linux and Windows, the two platforms the code is exercised on. macOS is
+# built but not tested: compiling it on every push is what stops a release tag from being
+# the first time a macOS target is tried, which is the failure this matrix exists to
+# prevent. Adding `test` to the macOS leg is a one-word change once someone has a Mac to
+# confirm the PTY tests behave there.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first one's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cargo caps lints for registry dependencies, so this only promotes warnings in
+  # catshell's own crates.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: lint
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # --all-targets so tests and benches are linted too, not just the library code.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing is not a reason to hide the others' results.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest: the release binaries are built against this
+          # glibc, so CI should compile against the same one.
+          - name: Linux
+            os: ubuntu-22.04
+            test: true
+          - name: Windows
+            os: windows-latest
+            test: true
+          - name: macOS
+            os: macos-latest
+            test: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: ./.github/actions/linux-deps
+
+      - uses: ./.github/actions/cargo-cache
+        with:
+          key: test-${{ matrix.name }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --workspace --locked

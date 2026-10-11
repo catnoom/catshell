@@ -1,0 +1,22 @@
+# The X11 and Wayland libraries eframe needs to link against, on the one platform where
+# they are not part of the runner image. A no-op everywhere else, so every job can call
+# it unconditionally rather than repeating the same `if` at each use.
+name: Linux display dependencies
+description: Installs the X11 and Wayland development packages eframe links against.
+
+runs:
+  using: composite
+  steps:
+    # x11-dl and xkbcommon-dl open their libraries at runtime, but winit's `wayland`
+    # feature (without `wayland-dlopen`) links libwayland-client at build time, and so
+    # does arboard's Wayland clipboard. Without these the build fails at the link step.
+    - name: Install display libraries
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          pkg-config \
+          libwayland-dev \
+          libxkbcommon-dev \
+          libx11-dev
