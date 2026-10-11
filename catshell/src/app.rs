@@ -194,6 +194,22 @@ enum TransferState {
 }
 
 impl TransferRow {
+    /// How the row describes itself, in the tense that matches what happened.
+    ///
+    /// A row still reading "Uploading" after the upload finished is simply wrong, and
+    /// leaves the user unsure whether anything completed.
+    fn status(&self) -> String {
+        match &self.state {
+            TransferState::Queued => {
+                format!("Waiting to {}", self.direction.noun().to_lowercase())
+            }
+            TransferState::Running => self.direction.verb().to_string(),
+            TransferState::Finished => self.direction.past().to_string(),
+            TransferState::Cancelled => format!("{} stopped", self.direction.noun()),
+            TransferState::Failed(_) => format!("{} failed", self.direction.noun()),
+        }
+    }
+
     fn is_active(&self) -> bool {
         matches!(self.state, TransferState::Queued | TransferState::Running)
     }
@@ -1072,7 +1088,7 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for row in &self.transfers {
                 ui.horizontal(|ui| {
-                    ui.label(row.direction.verb());
+                    ui.label(row.status());
                     ui.strong(&row.name);
                     // The full destination, so a finished transfer never leaves anyone
                     // wondering where the file actually went.
@@ -1096,7 +1112,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "stopped after {}",
+                                    "after {}",
                                     explorer::human_size(row.transferred)
                                 ))
                                 .small(),
@@ -2953,6 +2969,46 @@ mod tests {
             local: std::path::PathBuf::from("/tmp/file.bin"),
             remote: "/srv/file.bin".into(),
         }
+    }
+
+    #[test]
+    fn a_row_describes_itself_in_the_right_tense() {
+        use catshell_net::transfer::Direction;
+
+        let with = |direction, state| {
+            let mut r = row(10, 0, state);
+            r.direction = direction;
+            r.status()
+        };
+
+        assert_eq!(
+            with(Direction::Upload, TransferState::Queued),
+            "Waiting to upload"
+        );
+        assert_eq!(with(Direction::Upload, TransferState::Running), "Uploading");
+        // The one that was reported: a finished transfer must stop saying "Uploading".
+        assert_eq!(with(Direction::Upload, TransferState::Finished), "Uploaded");
+        assert_eq!(
+            with(Direction::Upload, TransferState::Cancelled),
+            "Upload stopped"
+        );
+        assert_eq!(
+            with(Direction::Upload, TransferState::Failed("no".into())),
+            "Upload failed"
+        );
+
+        assert_eq!(
+            with(Direction::Download, TransferState::Running),
+            "Downloading"
+        );
+        assert_eq!(
+            with(Direction::Download, TransferState::Finished),
+            "Downloaded"
+        );
+        assert_eq!(
+            with(Direction::Download, TransferState::Queued),
+            "Waiting to download"
+        );
     }
 
     #[test]

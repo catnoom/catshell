@@ -38,10 +38,27 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// What is happening now: "Uploading".
     pub fn verb(self) -> &'static str {
         match self {
             Direction::Upload => "Uploading",
             Direction::Download => "Downloading",
+        }
+    }
+
+    /// What happened: "Uploaded".
+    pub fn past(self) -> &'static str {
+        match self {
+            Direction::Upload => "Uploaded",
+            Direction::Download => "Downloaded",
+        }
+    }
+
+    /// The thing itself: "Upload", for phrases like "Upload failed".
+    pub fn noun(self) -> &'static str {
+        match self {
+            Direction::Upload => "Upload",
+            Direction::Download => "Download",
         }
     }
 }
@@ -724,8 +741,14 @@ mod tests {
     }
 
     #[test]
-    fn directions_read_as_what_they_are_doing() {
+    fn a_direction_can_describe_itself_in_each_tense() {
+        // A row that says "Uploading" after the upload has finished is simply wrong.
         assert_eq!(Direction::Upload.verb(), "Uploading");
+        assert_eq!(Direction::Upload.past(), "Uploaded");
+        assert_eq!(Direction::Upload.noun(), "Upload");
+
         assert_eq!(Direction::Download.verb(), "Downloading");
+        assert_eq!(Direction::Download.past(), "Downloaded");
+        assert_eq!(Direction::Download.noun(), "Download");
     }
 }
