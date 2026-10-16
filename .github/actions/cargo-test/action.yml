@@ -1,0 +1,44 @@
+# Runs the test suite and makes a failure readable.
+#
+# Reading a failing run should not require downloading a log — which, on this repository,
+# only someone with admin rights can do at all. The failures are re-emitted as workflow
+# annotations so they appear at the top of the run, and the whole output is kept as an
+# artifact for anything the annotations cut off.
+#
+# Shared between CI and the release workflow so a release that stops on a failing test
+# says the same thing a pull request does.
+name: Cargo test
+description: Runs the workspace tests, reporting failures as annotations.
+
+inputs:
+  name:
+    description: Platform name, used to tell the saved outputs apart.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Test
+      shell: bash
+      run: |
+        set -o pipefail
+        # --no-fail-fast so one broken crate does not hide the rest.
+        if cargo test --workspace --locked --no-fail-fast 2>&1 | tee test-output.txt; then
+          exit 0
+        fi
+
+        # Ten annotations are shown per run, so the panics go first: they say what
+        # actually went wrong, while the list of names only says where. A panic spans
+        # two lines — the location, then the assertion that failed.
+        awk '/panicked at/ { where = $0; getline; print "::error::" where " " $0 }' \
+          test-output.txt || true
+        grep -E '^test .* FAILED' test-output.txt | sed 's/^/::error::/' || true
+        exit 1
+
+    - name: Keep the test output
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-output-${{ inputs.name }}
+        path: test-output.txt
+        if-no-files-found: ignore

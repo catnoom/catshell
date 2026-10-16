@@ -82,31 +82,8 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
-      # --no-fail-fast so one broken crate does not hide the rest, and the failures are
-      # re-emitted as workflow annotations: they then appear at the top of the run,
-      # which is the difference between reading a failure and hunting for it in a log.
       - name: Test
         if: matrix.test
-        shell: bash
-        run: |
-          set -o pipefail
-          if cargo test --workspace --locked --no-fail-fast 2>&1 | tee test-output.txt; then
-            exit 0
-          fi
-
-          # Ten annotations are shown per run, so the panics go first: they say what
-          # actually went wrong, while the list of names only says where. A panic spans
-          # two lines — the location, then the assertion that failed.
-          awk '/panicked at/ { where = $0; getline; print "::error::" where " " $0 }' \
-            test-output.txt || true
-          grep -E '^test .* FAILED' test-output.txt | sed 's/^/::error::/' || true
-          exit 1
-
-      # Annotations are a summary; this is the whole run, for anything they cut off.
-      - name: Keep the test output
-        if: failure() && matrix.test
-        uses: actions/upload-artifact@v4
+        uses: ./.github/actions/cargo-test
         with:
-          name: test-output-${{ matrix.name }}
-          path: test-output.txt
-          if-no-files-found: ignore
+          name: ${{ matrix.name }}

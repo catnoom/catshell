@@ -87,7 +87,9 @@ jobs:
       # release can be cut from a commit CI never saw.
       - name: Test
         if: matrix.test
-        run: cargo test --workspace --locked
+        uses: ./.github/actions/cargo-test
+        with:
+          name: ${{ matrix.name }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --package catshell
