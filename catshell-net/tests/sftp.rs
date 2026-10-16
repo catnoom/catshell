@@ -101,6 +101,35 @@ struct SftpHandler {
     files: HashMap<String, PathBuf>,
     next_handle: usize,
     root: PathBuf,
+    /// Set by the one test that needs a transfer to be caught in the act.
+    gate: Option<Arc<WriteGate>>,
+}
+
+/// Holds the server's first write until a test lets it through.
+///
+/// A test that cancels a running transfer has to know the transfer is still running, and
+/// waiting for a progress report does not establish that: reports are throttled, so on a
+/// fast enough machine the first one to arrive is the last one, emitted as the transfer
+/// finishes. Stopping the server mid-write takes the machine's speed out of it
+/// altogether.
+struct WriteGate {
+    /// Signalled once the server has a write in hand and is holding it.
+    arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Taken by the first write, which then waits on it.
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl WriteGate {
+    /// Block the first caller until the test releases it; later callers pass straight
+    /// through, so only the start of the transfer is held.
+    async fn hold(&self) {
+        // The guard is dropped before awaiting: it is a plain mutex.
+        let release = self.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = self.arrived.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -219,6 +248,10 @@ impl russh_sftp::server::Handler for SftpHandler {
     ) -> Result<Status, Self::Error> {
         use std::io::{Seek as _, Write as _};
 
+        if let Some(gate) = &self.gate {
+            gate.hold().await;
+        }
+
         let path = self
             .files
             .get(&handle)
@@ -335,6 +368,7 @@ fn ok_status(id: u32) -> Status {
 #[derive(Clone)]
 struct TestServer {
     root: PathBuf,
+    gate: Option<Arc<WriteGate>>,
     connections: Arc<AtomicUsize>,
     /// Connections currently open, so a test can see one actually close rather than
     /// only see a new one appear.
@@ -350,6 +384,7 @@ impl russh::server::Server for TestServer {
         self.live.fetch_add(1, Ordering::SeqCst);
         SshHandlerImpl {
             root: self.root.clone(),
+            gate: self.gate.clone(),
             channels: Arc::clone(&self.channels),
             live: Arc::clone(&self.live),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -359,6 +394,7 @@ impl russh::server::Server for TestServer {
 
 struct SshHandlerImpl {
     root: PathBuf,
+    gate: Option<Arc<WriteGate>>,
     channels: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
     /// Channels awaiting a subsystem request. `subsystem_request` is handed only a
@@ -435,6 +471,7 @@ impl SshHandler for SshHandlerImpl {
                 files: HashMap::new(),
                 next_handle: 0,
                 root: self.root.clone(),
+                gate: self.gate.clone(),
             },
         )
         .await;
@@ -456,6 +493,15 @@ struct Fixture {
 
 impl Fixture {
     async fn start(name: &str) -> Self {
+        Self::start_with_gate(name, None).await
+    }
+
+    /// Start a server whose first write waits for the test. See [`WriteGate`].
+    async fn start_gated(name: &str, gate: Arc<WriteGate>) -> Self {
+        Self::start_with_gate(name, Some(gate)).await
+    }
+
+    async fn start_with_gate(name: &str, gate: Option<Arc<WriteGate>>) -> Self {
         let dir = TempDir::new(name);
         let known_hosts_dir = TempDir::new(&format!("{name}-kh"));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -484,6 +530,7 @@ impl Fixture {
         tokio::spawn(async move {
             let mut server = TestServer {
                 root,
+                gate,
                 connections: server_connections,
                 live: server_live,
                 channels: server_channels,
@@ -816,6 +863,8 @@ async fn serve_forever() {
 
     let mut server = TestServer {
         root,
+        // Nothing to hold back: this one serves the real application, not a test.
+        gate: None,
         connections: Arc::new(AtomicUsize::new(0)),
         live: Arc::new(AtomicUsize::new(0)),
         channels: Arc::new(AtomicUsize::new(0)),
@@ -1003,24 +1052,35 @@ async fn progress_is_reported_as_the_bytes_move() {
 #[tokio::test]
 async fn a_transfer_can_be_cancelled_and_leaves_what_it_wrote() {
     // The partial file is kept on purpose: it is what makes resuming possible.
-    let fixture = Fixture::start("cancel").await;
+    //
+    // The cancel has to arrive while the transfer is running, so the server is stopped
+    // mid-write and only let go once the cancel is in. Waiting for a progress report
+    // instead looks equivalent and is not: reports are throttled to one every 100ms, so
+    // on a machine that moves the whole file faster than that, the first report to
+    // arrive is the final one and the transfer is already over.
+    let (arrived, mut first_write) = tokio::sync::mpsc::unbounded_channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let gate = Arc::new(WriteGate {
+        arrived,
+        release: Mutex::new(Some(released)),
+    });
+
+    let fixture = Fixture::start_gated("cancel", gate).await;
     let source = fixture.dir.path().join("large.bin");
-    std::fs::write(&source, vec![3u8; 40_000_000]).unwrap();
+    let total = 4_000_000u64;
+    std::fs::write(&source, vec![3u8; total as usize]).unwrap();
 
     let queue = queue_for(&fixture, NEVER_IDLE);
-
-    let total = 40_000_000u64;
     let target = format!("{}/partial.bin", fixture.dir.as_str());
+    let mut watcher = Watcher::new(&queue);
     let id = queue.enqueue(Direction::Upload, source, target.clone(), total);
 
-    // Cancel once it is genuinely under way, but long before it could finish.
-    let mut watcher = Watcher::new(&queue);
-    watcher
-        .until("some progress", |event| {
-            matches!(event, TransferEvent::Progress { transferred, .. } if *transferred > 0)
-        })
-        .await;
+    first_write
+        .recv()
+        .await
+        .expect("the server never reached a write");
     queue.cancel(id);
+    let _ = release.send(());
 
     watcher
         .until(
