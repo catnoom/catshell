@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "catshell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "catshell-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "catshell-term"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
