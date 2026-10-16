@@ -48,7 +48,7 @@ impl TempDir {
         std::fs::create_dir_all(&path).unwrap();
         // Resolve symlinks now (on macOS /tmp is one), so paths the server reports match
         // what the test expects.
-        Self(path.canonicalize().unwrap())
+        Self(posix_style(path.canonicalize().unwrap()))
     }
 
     fn path(&self) -> &Path {
@@ -64,6 +64,32 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Make a local path usable as an SFTP path as well.
+///
+/// This directory stands in for a remote one, so its path is handed to the client and
+/// comes back with remote path components joined onto it — with `/`, because SFTP paths
+/// are POSIX whatever the server runs on. Windows is happy to accept `/` in a path, with
+/// one exception: `canonicalize` returns an extended-length path (`\\?\C:\...`), which
+/// is passed to the filesystem verbatim with no separator translation at all, so a `/`
+/// joined onto it makes the whole path invalid. Normalising here keeps the fixture's one
+/// path valid both as a local path and as a remote one.
+#[cfg(windows)]
+fn posix_style(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    // Only a plain drive path; a verbatim UNC path (`\\?\UNC\...`) is not ours to
+    // rewrite, and no temporary directory is one.
+    let text = match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest,
+        _ => &text,
+    };
+    PathBuf::from(text.replace('\\', "/"))
+}
+
+#[cfg(not(windows))]
+fn posix_style(path: PathBuf) -> PathBuf {
+    path
 }
 
 // --- An SFTP server backed by the local filesystem ---------------------------------

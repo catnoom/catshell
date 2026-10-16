@@ -70,8 +70,8 @@ pub struct GlyphAtlas {
     family: String,
     /// The concrete family the system resolved that to. See [`resolve_family`].
     resolved_family: String,
-    /// Whether the resolved family ships a real bold face. When it does not, bold is
-    /// emboldened synthetically rather than silently rendering as regular.
+    /// Whether asking for bold actually gets a different face. When it does not, bold
+    /// is emboldened synthetically rather than silently rendering as regular.
     has_bold_face: bool,
     font_size: f32,
     metrics: CellMetrics,
@@ -101,7 +101,7 @@ impl GlyphAtlas {
         let physical_size = font_size * scale;
         let resolved_family = resolve_family(&mut font_system, family);
         let metrics = measure(&mut font_system, &resolved_family, physical_size);
-        let has_bold_face = family_has_bold(&font_system, &resolved_family);
+        let has_bold_face = family_has_bold(&mut font_system, &resolved_family);
 
         let mut atlas = Self {
             font_system,
@@ -168,7 +168,7 @@ impl GlyphAtlas {
         }
         self.family = family.to_owned();
         self.resolved_family = resolve_family(&mut self.font_system, family);
-        self.has_bold_face = family_has_bold(&self.font_system, &self.resolved_family);
+        self.has_bold_face = family_has_bold(&mut self.font_system, &self.resolved_family);
         self.font_size = physical_size;
         self.metrics = measure(&mut self.font_system, &self.resolved_family, physical_size);
 
@@ -392,13 +392,41 @@ fn embolden(data: &[u8], width: u32, height: u32, stride: usize) -> Vec<u8> {
     out
 }
 
-/// Whether `family` includes an upright face heavy enough to serve as bold.
-fn family_has_bold(font_system: &FontSystem, family: &str) -> bool {
-    font_system.db().faces().any(|face| {
-        face.style == fontdb::Style::Normal
-            && face.weight.0 >= 600
-            && face.families.iter().any(|(name, _)| name == family)
-    })
+/// Whether asking `family` for bold actually gets a different face.
+///
+/// The font database is the wrong thing to ask. It can list a bold face for the family
+/// that the matcher then declines to use — the request comes back as the regular face,
+/// and bold renders identically to regular, which is bold the user cannot see. Shaping
+/// the same character both ways and comparing the face that came back answers the
+/// question that actually matters, and costs one shaping at startup.
+fn family_has_bold(font_system: &mut FontSystem, family: &str) -> bool {
+    match (
+        shaped_face(font_system, family, false),
+        shaped_face(font_system, family, true),
+    ) {
+        (Some(regular), Some(bold)) => regular != bold,
+        // Nothing came back to compare, so assume no bold face: emboldening something
+        // unnecessarily is a far smaller fault than showing bold as regular.
+        _ => false,
+    }
+}
+
+/// The face the matcher picks for `family` at the given weight.
+fn shaped_face(font_system: &mut FontSystem, family: &str, bold: bool) -> Option<fontdb::ID> {
+    // Any size will do; this asks which face, not how big.
+    let mut buffer = Buffer::new(font_system, Metrics::new(16.0, 20.0));
+    let attrs = Attrs::new().family(Family::Name(family));
+    let attrs = if bold {
+        attrs.weight(Weight::BOLD)
+    } else {
+        attrs
+    };
+    buffer.set_text("M", &attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+        .layout_runs()
+        .next()
+        .and_then(|run| run.glyphs.first().map(|glyph| glyph.font_id))
 }
 
 /// Resolve a family name to the concrete family the system actually chose for it.
@@ -648,10 +676,30 @@ mod tests {
         assert_ne!(plain.uv, bold.uv, "bold reused the regular glyph's slot");
     }
 
+    /// Total coverage of a packed glyph, read back out of the atlas.
+    fn ink(atlas: &GlyphAtlas, glyph: &Glyph) -> u64 {
+        let x = (glyph.uv[0] * ATLAS_SIZE as f32).round() as u32;
+        let y = (glyph.uv[1] * ATLAS_SIZE as f32).round() as u32;
+        let mut total = 0;
+        for row in 0..glyph.size[1] as u32 {
+            for col in 0..glyph.size[0] as u32 {
+                // Alpha is the coverage; the colour channels are a constant white.
+                let alpha = (((y + row) * ATLAS_SIZE + x + col) * 4 + 3) as usize;
+                total += atlas.pixels[alpha] as u64;
+            }
+        }
+        total
+    }
+
     #[test]
     fn bold_is_visibly_heavier_than_regular() {
         // Whether the family has a real bold face or gets the synthetic one, bold must
-        // end up wider than regular; otherwise it is indistinguishable on screen.
+        // put more ink on the screen than regular; otherwise it is indistinguishable.
+        //
+        // Ink rather than width: a monospace bold face commonly has the same bounding
+        // box as its regular face and simply draws heavier strokes, so comparing widths
+        // measures which font is installed instead of whether bold can be seen. That is
+        // exactly how this test came to pass on one machine and fail on another.
         let mut atlas = atlas();
         let plain = atlas.glyph('M', FontStyle::default()).unwrap();
         let bold = atlas
@@ -664,10 +712,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            bold.size[0] > plain.size[0],
-            "bold 'M' is {} wide, regular is {} — bold is not distinguishable",
-            bold.size[0],
-            plain.size[0]
+            ink(&atlas, &bold) > ink(&atlas, &plain),
+            "bold 'M' carries {} coverage, regular {} — bold is not distinguishable",
+            ink(&atlas, &bold),
+            ink(&atlas, &plain)
         );
     }
 

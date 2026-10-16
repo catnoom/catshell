@@ -94,8 +94,19 @@ jobs:
             exit 0
           fi
 
-          grep -E '^test .* FAILED' test-output.txt | sed 's/^/::error::/' || true
-          # A panic spans two lines: the location, then the assertion that failed.
+          # Ten annotations are shown per run, so the panics go first: they say what
+          # actually went wrong, while the list of names only says where. A panic spans
+          # two lines — the location, then the assertion that failed.
           awk '/panicked at/ { where = $0; getline; print "::error::" where " " $0 }' \
             test-output.txt || true
+          grep -E '^test .* FAILED' test-output.txt | sed 's/^/::error::/' || true
           exit 1
+
+      # Annotations are a summary; this is the whole run, for anything they cut off.
+      - name: Keep the test output
+        if: failure() && matrix.test
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.name }}
+          path: test-output.txt
+          if-no-files-found: ignore
